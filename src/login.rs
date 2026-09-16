@@ -24,12 +24,16 @@ pub const SERVICE_LIST: [&str; SERVICE_COUNT] = [
 /// 校园网 SSO 域名，用于从网关重定向地址里识别认证入口。
 const SSO_HOST: &str = "sso.yzu.edu.cn";
 
-/// 未认证时会被网关重定向的探测地址。
+/// 未认证时会被网关重定向的校园网门户根地址。
 ///
 /// 会话参数（`wlanuserip`、`mac` 等）由网关按当次连接生成并做了私有加密，
-/// 无法本地推算，只能在重定向地址里现取；它们绑定具体设备，不适合硬编码进源码。
-/// 首选门户本身（校园网内可达、无需 DNS），备选业界通用的连通性探测地址。
-const DETECT_URLS: [&str; 2] = ["http://10.245.2.20/", "http://connect.rom.miui.com/generate_204"];
+/// 无法本地推算，只能在重定向链里现取；它们绑定具体设备，不适合硬编码进源码。
+/// 未认证时访问门户，网关会一路重定向到 SSO 登录页，登录所需参数就在 SSO
+/// 地址的 `service` 参数里。
+const PORTAL_URL: &str = "http://10.245.2.20/";
+
+/// 从门户根地址到 SSO 登录页最多跟随的重定向次数。
+const MAX_REDIRECT_HOPS: usize = 3;
 
 const GET_TIMEOUT: Duration = Duration::from_secs(5);
 const POST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -90,27 +94,42 @@ fn sso_url_from_location(location: &str) -> Option<String> {
     }
 }
 
-/// 探测网关，取回本次会话的 SSO 入口地址。
+/// 顺着网关的重定向链取回本次会话的 SSO 入口地址。
 ///
 /// 返回 `Ok(None)` 表示网关有响应但没有给出认证入口，也就是当前已在线。
 fn discover_sso_url(client: &Client) -> Result<Option<String>, LoginError> {
+    // 从门户根地址出发，跟着网关的重定向链（门户页 → SSO 登录页）找到 SSO 入口。
+    let mut current = PORTAL_URL.to_string();
     let mut responded = false;
     let mut last_error = None;
-    for url in DETECT_URLS {
-        match client.get(url).timeout(DETECT_TIMEOUT).send() {
+
+    for _ in 0..MAX_REDIRECT_HOPS {
+        match client.get(&current).timeout(DETECT_TIMEOUT).send() {
             Ok(response) => {
                 responded = true;
                 let location = response
                     .headers()
                     .get(LOCATION)
                     .and_then(|value| value.to_str().ok());
-                if let Some(sso_url) = location.and_then(sso_url_from_location) {
-                    return Ok(Some(sso_url));
+                match location {
+                    Some(loc) => {
+                        if let Some(sso_url) = sso_url_from_location(loc) {
+                            return Ok(Some(sso_url));
+                        }
+                        // 网关可能先跳到门户页（index.jsp），再跳到 SSO：跟一步。
+                        current = loc.to_string();
+                    }
+                    // 没有重定向：当前已在线或已认证，没有认证入口。
+                    None => return Ok(None),
                 }
             }
-            Err(error) => last_error = Some(LoginError::from_reqwest(error)),
+            Err(error) => {
+                last_error = Some(LoginError::from_reqwest(error));
+                break;
+            }
         }
     }
+
     if responded {
         Ok(None)
     } else {

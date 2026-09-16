@@ -52,7 +52,7 @@ impl Config {
 
         toml::from_str(&contents).map_err(|source| ConfigError::Parse {
             path: path.to_path_buf(),
-            source,
+            source: Box::new(source),
         })
     }
 
@@ -84,7 +84,8 @@ pub enum ConfigError {
     /// 配置文件存在但格式不对
     Parse {
         path: PathBuf,
-        source: toml::de::Error,
+        /// 装箱以免 `ConfigError` 过大触发 clippy::result_large_err
+        source: Box<toml::de::Error>,
     },
     /// user_id 或 password 为空
     MissingCredentials,
@@ -126,7 +127,7 @@ impl Error for ConfigError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             ConfigError::Read { source, .. } => Some(source),
-            ConfigError::Parse { source, .. } => Some(source),
+            ConfigError::Parse { source, .. } => Some(&**source),
             _ => None,
         }
     }
@@ -172,7 +173,7 @@ mod tests {
     #[test]
     fn parse_error_does_not_display_credentials() {
         let source = toml::from_str::<Config>("password = secret-password").unwrap_err();
-        let error = ConfigError::Parse { path: "config.toml".into(), source };
+        let error = ConfigError::Parse { path: "config.toml".into(), source: Box::new(source) };
         assert!(!error.to_string().contains("secret-password"));
     }
 }

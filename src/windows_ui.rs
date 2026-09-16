@@ -160,8 +160,10 @@ impl App {
 pub fn run(path: PathBuf, minimized: bool) -> Result<(), Box<dyn Error>> {
     nwg::init()?;
     nwg::Font::set_global_family("Microsoft YaHei UI")?;
-    let mut controls = Controls::default();
-    controls.icon = nwg::Icon::from_system(nwg::OemIcon::Information);
+    let mut controls = Controls {
+        icon: nwg::Icon::from_system(nwg::OemIcon::Information),
+        ..Controls::default()
+    };
     nwg::Window::builder()
         .title(TITLE)
         .size((700, 470))

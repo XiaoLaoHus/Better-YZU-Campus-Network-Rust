@@ -12,12 +12,21 @@ CALLBACK = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 user32.EnumWindows.argtypes = [CALLBACK, wintypes.LPARAM]
 user32.EnumChildWindows.argtypes = [wintypes.HWND, CALLBACK, wintypes.LPARAM]
 user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
-user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 user32.IsWindowVisible.argtypes = [wintypes.HWND]
 user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
 user32.FindWindowW.restype = wintypes.HWND
+user32.SendMessageTimeoutW.argtypes = [
+    wintypes.HWND, wintypes.UINT, wintypes.WPARAM, ctypes.c_size_t,
+    wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t),
+]
+user32.SendMessageTimeoutW.restype = wintypes.LPARAM
 TRAY_MESSAGE = 0x8000 + 20
+# GetWindowTextW 读不到其他进程里控件的文本（对子控件一律返回空串），
+# 只能取到顶层窗口标题。WM_GETTEXT 属于系统消息，系统会帮我们跨进程传递缓冲区。
+WM_GETTEXT = 0x000D
+SMTO_ABORTIFHUNG = 0x0002
+MESSAGE_TIMEOUT_MS = 2000
 
 
 def wait_until(check, description, timeout=20):
@@ -32,7 +41,12 @@ def wait_until(check, description, timeout=20):
 
 def text(hwnd):
     value = ctypes.create_unicode_buffer(1_000_000)
-    user32.GetWindowTextW(hwnd, value, len(value))
+    result = ctypes.c_size_t()
+    # 带超时，避免目标进程无响应时把测试挂死。
+    user32.SendMessageTimeoutW(
+        hwnd, WM_GETTEXT, len(value), ctypes.addressof(value),
+        SMTO_ABORTIFHUNG, MESSAGE_TIMEOUT_MS, ctypes.byref(result),
+    )
     return value.value
 
 

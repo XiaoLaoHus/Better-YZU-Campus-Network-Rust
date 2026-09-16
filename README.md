@@ -19,8 +19,17 @@
 
 #### 方式一：下载编译好的可执行文件（推荐）
 
-前往本仓库的 [Actions](../../actions) 页面，打开最近一次成功的 workflow 运行，
-在页面底部的 **Artifacts** 区域下载对应平台的可执行文件，解压后即可运行。
+前往 [Releases](../../releases) 页面，下载对应平台的压缩包，解压后即可运行，
+无需安装任何运行时环境。
+
+| 平台 | 压缩包 |
+| :--- | :--- |
+| Windows | `...-windows-x86_64.zip` |
+| Linux | `...-linux-x86_64.zip` |
+| macOS（Apple Silicon） | `...-macos-arm64.zip` |
+| macOS（Intel / 黑苹果） | `...-macos-x86_64.zip` |
+
+> 每个包里包含可执行文件、`config.example.toml` 和本说明文档。
 
 #### 方式二：自行编译
 
@@ -91,14 +100,16 @@ Start-Process -WindowStyle Hidden .\better-yzu-campus-network.exe
 ### 4\. 项目结构
 
 ```
-Cargo.toml               依赖与构建配置
-config.example.toml      配置模板（提交到仓库）
-config.toml              你的真实配置（不提交）
+Cargo.toml                   依赖与构建配置
+config.example.toml          配置模板（提交到仓库）
+config.toml                  你的真实配置（不提交）
 src/
-  main.rs                入口：读取配置、主循环、参数解析
-  config.rs              Config 结构体、加载与校验
-  login.rs               网关参数解析与登录请求
-.github/workflows/ci.yml 编译、检查与冒烟测试
+  main.rs                    入口：读取配置、主循环、参数解析
+  config.rs                  Config 结构体、加载与校验
+  login.rs                   网关参数解析与登录请求
+.github/workflows/
+  ci.yml                     每次 push 编译、clippy、fmt 与冒烟测试
+  release.yml                打 v* tag 时构建三平台并发布 Release
 ```
 
 -----

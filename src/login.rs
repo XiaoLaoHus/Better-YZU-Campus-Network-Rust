@@ -24,15 +24,23 @@ pub const SERVICE_LIST: [&str; SERVICE_COUNT] = [
 /// 校园网 SSO 域名，用于从网关重定向地址里识别认证入口。
 const SSO_HOST: &str = "sso.yzu.edu.cn";
 
-/// 未认证时会被网关重定向的校园网门户根地址。
+/// 校园网门户主机（同时用于校验登录请求的去向）。
+const PORTAL_HOST: &str = "10.245.2.20";
+
+/// 探测地址，按顺序尝试，命中即止。
 ///
 /// 会话参数（`wlanuserip`、`mac` 等）由网关按当次连接生成并做了私有加密，
 /// 无法本地推算，只能在重定向链里现取；它们绑定具体设备，不适合硬编码进源码。
-/// 未认证时访问门户，网关会一路重定向到 SSO 登录页，登录所需参数就在 SSO
-/// 地址的 `service` 参数里。
-const PORTAL_URL: &str = "http://10.245.2.20/";
+///
+/// 用外网 HTTP 地址而不是门户本身来触发：未认证时网关会拦截对外请求并重定向到
+/// SSO，认证参数就是在这一步产生的；而直接访问门户主机时，网关往往直接返回门户
+/// 页面（HTTP 200，不带跳转），拿不到任何入口。门户根地址作为兜底放在最后。
+const PROBE_URLS: [&str; 2] = [EXTERNAL_PROBE, "http://10.245.2.20/"];
 
-/// 从门户根地址到 SSO 登录页最多跟随的重定向次数。
+/// 触发网关拦截的外网探测地址（必须是 HTTP：HTTPS 无法被网关重定向）。
+const EXTERNAL_PROBE: &str = "http://www.baidu.com/";
+
+/// 单次探测最多跟随的重定向次数。
 const MAX_REDIRECT_HOPS: usize = 3;
 
 const GET_TIMEOUT: Duration = Duration::from_secs(5);
@@ -79,15 +87,56 @@ struct RedirectInfo {
     referer: String,
 }
 
+/// 把地址脱敏成可以安全写进日志的形式：保留协议、主机、路径和参数**名**。
+///
+/// 网关下发的 `Location` 里 `mac`、`wlanuserip` 等是个人数据，值一律不写日志。
+fn redact(url: &str) -> String {
+    let Ok(parsed) = Url::parse(url) else {
+        return "<无法解析的地址>".to_string();
+    };
+    let mut text = parsed[..url::Position::BeforeQuery].to_string();
+    let names: Vec<String> = parsed.query_pairs().map(|(key, _)| key.into_owned()).collect();
+    if !names.is_empty() {
+        text.push_str(&format!("?[{}]", names.join(",")));
+    }
+    text
+}
+
+/// 判断主机是否是校园网内网的私有 IPv4 地址。
+///
+/// 登录请求会把密码发往这个主机，因此只接受私有地址，避免被伪造成认证入口的
+/// 外部主机骗走凭据。
+fn is_private_host(host: &str) -> bool {
+    host.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_private())
+}
+
+/// 把 `Location` 头解析成绝对地址。网关可能下发相对路径（如 `/eportal/index.jsp`），
+/// 必须按当前地址补齐，否则下一次请求会拿到非法地址。
+fn resolve_location(base: &str, location: &str) -> Option<String> {
+    Url::parse(base).ok()?.join(location).ok().map(|url| url.to_string())
+}
+
 /// 从重定向地址中识别 SSO 登录入口。
 ///
-/// 未认证时网关把请求重定向到 SSO 登录页（含 `service` 参数）；已认证时重定向到
-/// 门户的成功页，此时返回 `None`。
+/// 未认证时网关把请求重定向到 SSO 登录页；已认证时重定向到门户的成功页，
+/// 此时返回 `None`。
+///
+/// 识别条件收敛为两条，避免把外网的任意跳转误当成认证入口：
+/// 主机是校园 SSO，或 `service` 参数指向校园门户。
 fn sso_url_from_location(location: &str) -> Option<String> {
     let parsed = Url::parse(location).ok()?;
-    let is_sso_host = parsed.host_str() == Some(SSO_HOST);
-    let has_service = parsed.query_pairs().any(|(key, _)| key == "service");
-    if is_sso_host || has_service {
+    if parsed.host_str() == Some(SSO_HOST) {
+        return Some(location.to_string());
+    }
+
+    // 认证页也可能挂在别的域名下，此时以 `service` 参数指向门户为准
+    let points_to_portal = parsed
+        .query_pairs()
+        .find(|(key, _)| key == "service")
+        .and_then(|(_, value)| Url::parse(&value).ok())
+        .is_some_and(|target| target.host_str() == Some(PORTAL_HOST));
+
+    if points_to_portal {
         Some(location.to_string())
     } else {
         None
@@ -98,35 +147,51 @@ fn sso_url_from_location(location: &str) -> Option<String> {
 ///
 /// 返回 `Ok(None)` 表示网关有响应但没有给出认证入口，也就是当前已在线。
 fn discover_sso_url(client: &Client) -> Result<Option<String>, LoginError> {
-    // 从门户根地址出发，跟着网关的重定向链（门户页 → SSO 登录页）找到 SSO 入口。
-    let mut current = PORTAL_URL.to_string();
     let mut responded = false;
     let mut last_error = None;
 
-    for _ in 0..MAX_REDIRECT_HOPS {
-        match client.get(&current).timeout(DETECT_TIMEOUT).send() {
-            Ok(response) => {
-                responded = true;
-                let location = response
-                    .headers()
-                    .get(LOCATION)
-                    .and_then(|value| value.to_str().ok());
-                match location {
-                    Some(loc) => {
-                        if let Some(sso_url) = sso_url_from_location(loc) {
-                            return Ok(Some(sso_url));
-                        }
-                        // 网关可能先跳到门户页（index.jsp），再跳到 SSO：跟一步。
-                        current = loc.to_string();
-                    }
-                    // 没有重定向：当前已在线或已认证，没有认证入口。
-                    None => return Ok(None),
+    for probe in PROBE_URLS {
+        let mut current = probe.to_string();
+
+        for _ in 0..MAX_REDIRECT_HOPS {
+            show_msg(&format!("探测 {} ...", redact(&current)));
+
+            let response = match client.get(&current).timeout(DETECT_TIMEOUT).send() {
+                Ok(response) => response,
+                Err(error) => {
+                    let error = LoginError::from_reqwest(error);
+                    show_msg(&format!("  无法连接：{error}"));
+                    last_error = Some(error);
+                    break;
                 }
-            }
-            Err(error) => {
-                last_error = Some(LoginError::from_reqwest(error));
+            };
+            responded = true;
+
+            let status = response.status().as_u16();
+            let location = response
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok());
+
+            let Some(location) = location else {
+                // 没有重定向：可能已在线，也可能这个地址本来就不需要认证。
+                show_msg(&format!("  HTTP {status}，无跳转"));
                 break;
+            };
+
+            // 网关可能下发相对路径，必须按当前地址解析成绝对地址再跟下一步，
+            // 否则下一轮请求会因为拿到非法地址而直接失败、链路断掉。
+            let Some(next) = resolve_location(&current, location) else {
+                show_msg(&format!("  HTTP {status}，跳转地址无法解析"));
+                break;
+            };
+            show_msg(&format!("  HTTP {status}，跳转 → {}", redact(&next)));
+
+            if sso_url_from_location(&next).is_some() {
+                show_msg("找到认证入口，正在获取本次会话参数...");
+                return Ok(Some(next));
             }
+            current = next;
         }
     }
 
@@ -176,11 +241,21 @@ fn get_redirect_info(client: &Client, initial_sso_url: &str) -> Result<RedirectI
     let (ip, query_string) = match (ip.is_empty(), query_string) {
         (false, Some(query)) => (ip, query),
         _ => {
+            // 地址里含个人参数，写日志前先脱敏。
             return Err(LoginError::Flow(format!(
-                "无法从解析出的 URL 中提取 IP 或 QueryString。当前URL: {new_url}"
-            )))
+                "无法从解析出的 URL 中提取 IP 或 QueryString。当前URL: {}",
+                redact(&new_url)
+            )));
         }
     };
+
+    // 下面会把密码 POST 到这个主机，只允许校园网私有地址，
+    // 否则一个伪造的跳转就能把凭据引到外部服务器。
+    if !is_private_host(ip) {
+        return Err(LoginError::Flow(format!(
+            "认证服务器地址 {ip} 不是校园网内网地址，已中止以避免泄露账号密码。"
+        )));
+    }
 
     let login_url = format!("http://{ip}/eportal/InterFace.do?method=login");
 
@@ -323,8 +398,9 @@ mod tests {
             "https://sso.yzu.edu.cn/login?service=http%3A%2F%2F10.245.2.20%2Feportal%2Findex.jsp";
         assert_eq!(sso_url_from_location(sso).as_deref(), Some(sso));
         assert!(sso_url_from_location("https://sso.yzu.edu.cn/login").is_some());
-        // 网关也可能把认证页放在别的域名下，靠 service 参数识别
-        assert!(sso_url_from_location("http://gw.example/auth?service=eportal").is_some());
+        // 认证页也可能挂在别的域名下，此时以 service 参数指向门户为准
+        let other_host = "http://gw.example/auth?service=http%3A%2F%2F10.245.2.20%2Feportal";
+        assert!(sso_url_from_location(other_host).is_some());
     }
 
     #[test]
@@ -334,5 +410,46 @@ mod tests {
         assert!(sso_url_from_location(success_page).is_none());
         assert!(sso_url_from_location("").is_none());
         assert!(sso_url_from_location("不是合法的 URL").is_none());
+        // 外网地址即便带 service 参数也不算认证入口：否则一个伪造的跳转
+        // 就能把密码引到外部主机
+        let hostile = "http://evil.example/login?service=http%3A%2F%2Fevil.example%2F";
+        assert!(sso_url_from_location(hostile).is_none());
+    }
+
+    #[test]
+    fn resolves_relative_redirect_targets() {
+        // 网关下发相对路径时，必须按当前地址补齐，否则重定向链会断掉
+        assert_eq!(
+            resolve_location("http://10.245.2.20/", "/eportal/index.jsp").as_deref(),
+            Some("http://10.245.2.20/eportal/index.jsp")
+        );
+        // 绝对地址原样保留
+        let absolute = "https://sso.yzu.edu.cn/login?service=x";
+        assert_eq!(resolve_location("http://10.245.2.20/", absolute).as_deref(), Some(absolute));
+        // 基准地址本身非法时不应panic
+        assert!(resolve_location("不是合法的地址", "/a").is_none());
+    }
+
+    #[test]
+    fn redacts_personal_parameters_from_log_output() {
+        let with_secrets = "http://10.245.2.20/eportal/index.jsp?wlanuserip=SECRETIP&mac=SECRETMAC";
+        let safe = redact(with_secrets);
+        assert_eq!(safe, "http://10.245.2.20/eportal/index.jsp?[wlanuserip,mac]");
+        assert!(!safe.contains("SECRETIP"));
+        assert!(!safe.contains("SECRETMAC"));
+        // 无参数时保持原样
+        assert_eq!(redact("http://10.245.2.20/"), "http://10.245.2.20/");
+        assert_eq!(redact("不是合法的地址"), "<无法解析的地址>");
+    }
+
+    #[test]
+    fn only_accepts_private_hosts_for_login() {
+        // 校园网门户是私有地址，可以发凭据
+        assert!(is_private_host("10.245.2.20"));
+        assert!(is_private_host("192.168.1.1"));
+        // 公网地址和域名一律拒绝，避免密码被发到外部主机
+        assert!(!is_private_host("8.8.8.8"));
+        assert!(!is_private_host("evil.example"));
+        assert!(!is_private_host(""));
     }
 }

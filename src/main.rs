@@ -103,7 +103,7 @@ fn attach_console() {
     #[cfg(windows)]
     unsafe {
         // 保留 shell 重定向的管道；只为没有有效标准句柄的双击/终端启动附加控制台。
-        use winapi::um::{consoleapi::AttachConsole, processenv::GetStdHandle, winbase::STD_OUTPUT_HANDLE, wincon::ATTACH_PARENT_PROCESS};
+        use winapi::um::{processenv::GetStdHandle, winbase::STD_OUTPUT_HANDLE, wincon::{AttachConsole, ATTACH_PARENT_PROCESS}};
         let stdout = GetStdHandle(STD_OUTPUT_HANDLE);
         if stdout.is_null() || stdout == winapi::um::handleapi::INVALID_HANDLE_VALUE {
             AttachConsole(ATTACH_PARENT_PROCESS);

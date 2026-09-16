@@ -72,10 +72,10 @@ jobs:
           PY
 
       - name: 单元测试
-        run: cargo test --locked --all-targets --target ${{ matrix.target }}
+        run: cargo test --all-targets --target ${{ matrix.target }}
 
       - name: cargo build --release
-        run: cargo build --locked --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Windows 窗口与命令行冒烟测试
         if: runner.os == 'Windows'

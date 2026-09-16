@@ -5,14 +5,21 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   BIN_NAME: better-yzu-campus-network
 
 jobs:
   build-and-run:
-    name: 编译并运行
-    runs-on: ubuntu-latest
+    name: 编译与测试 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
 
     steps:
       - name: 检出代码
@@ -22,8 +29,6 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component clippy,rustfmt
           rustup default stable
-          rustc --version
-          cargo --version
 
       - name: 缓存依赖与构建产物
         uses: actions/cache@v4
@@ -32,53 +37,63 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # 编译放最前面：编译错误是最需要优先暴露的问题
-      - name: cargo build --release
-        run: cargo build --release --verbose
-
-      # clippy 与 fmt 暂不阻塞构建，先拿到信号
-      - name: cargo clippy（仅供参考，不阻塞）
-        continue-on-error: true
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: cargo fmt --check
+      - name: 格式检查
+        id: format
         continue-on-error: true
         run: cargo fmt --all -- --check
 
-      - name: 生成测试用 config.toml
+      - name: 提供 CI 格式化文件（不需要本地 Rust）
+        if: matrix.os == 'ubuntu-latest' && steps.format.outcome == 'failure'
+        run: cargo fmt --all
+
+      - name: 上传格式化文件
+        if: matrix.os == 'ubuntu-latest' && steps.format.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: formatted-sources
+          path: src/*.rs
+
+      - name: 单元测试
+        run: cargo test --all-targets
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: 编译发行程序
+        run: cargo build --release
+
+      - name: Linux 命令行冒烟测试
+        if: runner.os == 'Linux'
+        shell: bash
         run: |
           cp config.example.toml config.toml
-          sed -i 's/^user_id = ""/user_id = "ci-test-user"/' config.toml
-          sed -i 's/^password = ""/password = "ci-test-password"/' config.toml
-          cat config.toml
-
-      - name: 运行（--once，单次尝试后退出）
-        run: |
+          sed -i 's/^user_id = ""/user_id = "ci-test-user"/; s/^password = ""/password = "ci-test-password"/' config.toml
           set -o pipefail
-          timeout 120 "./target/release/${BIN_NAME}" --once | tee run.log
-          echo "退出码: $?"
-
-      - name: 校验输出
-        run: |
-          # 启动横幅出现，说明配置读取、校验、HTTP 客户端构建都正常
-          grep -q "启动了喵" run.log || { echo "❌ 未看到启动横幅"; exit 1; }
-          echo "✅ 启动正常"
-
-          # 网关是校园内网地址，GitHub runner 连不上属于预期情况
-          if grep -q "网络连接错误" run.log; then
-            echo "ℹ️ 无法连通校园网关（预期行为：CI 环境不在校内网）"
-          fi
-
-          # 帮助信息应当可用
+          timeout 30 "./target/release/${BIN_NAME}" --once | tee run.log
+          grep -q "启动了喵" run.log
           "./target/release/${BIN_NAME}" --help
+          # GitHub 不在校园网中；这里验证启动，不声称实际登录成功。
+
+      - name: Windows 窗口与命令行冒烟测试
+        if: runner.os == 'Windows'
+        run: python .github/scripts/windows-smoke.py target/release/better-yzu-campus-network.exe
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.BIN_NAME }}-linux-x86_64
-          path: target/release/${{ env.BIN_NAME }}
+          name: ${{ env.BIN_NAME }}-${{ runner.os }}
+          path: |
+            target/release/${{ env.BIN_NAME }}
+            target/release/${{ env.BIN_NAME }}.exe
           if-no-files-found: error
+
+      - name: 上传依赖锁文件
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-lock
+          path: Cargo.lock

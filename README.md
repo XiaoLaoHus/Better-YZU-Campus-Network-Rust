@@ -13,14 +13,25 @@
   * **自动登录：** 无需手动操作，自动完成校园网认证。
   * **断线重连：** 每隔 10 分钟（`interval_secs`，默认 600 秒）自动检查并尝试重新连接，确保网络持续在线。
   * **参数内置：** 网关参数解析逻辑已内置，用户无需手动复制复杂的认证 URL。
+  * **Windows 图形窗口与托盘：** 双击启动，无控制台黑框；关闭或最小化窗口后仍在后台运行，点击托盘图标即可恢复。右键托盘可打开窗口或退出。
+  * **运行日志：** Windows 窗口显示最近 200 行日志；登录请求在独立线程执行，界面不会因等待网络而卡住。
   * **单文件发行：** 编译产物是单个可执行文件，无需 Python 环境，也不用先装解释器和依赖。
 
 ### 2\. 环境要求
 
 #### 方式一：下载编译好的可执行文件（推荐）
 
-前往本仓库的 [Actions](../../actions) 页面，打开最近一次成功的 workflow 运行，
-在页面底部的 **Artifacts** 区域下载对应平台的可执行文件，解压后即可运行。
+前往 [Releases](../../releases) 页面，下载对应平台的压缩包，解压后即可运行，
+无需安装任何运行时环境。
+
+| 平台 | 压缩包 |
+| :--- | :--- |
+| Windows | `...-windows-x86_64.zip` |
+| Linux | `...-linux-x86_64.zip` |
+| macOS（Apple Silicon） | `...-macos-arm64.zip` |
+| macOS（Intel / 黑苹果） | `...-macos-x86_64.zip` |
+
+> 每个包里包含可执行文件、`config.example.toml` 和本说明文档。
 
 #### 方式二：自行编译
 
@@ -58,19 +69,44 @@ cp config.example.toml config.toml
 
 ### 3\. 使用方法
 
+#### Windows：窗口与系统托盘
+
+1. 解压 Windows 发行包，在 **exe 所在目录**将 `config.example.toml` 复制为 `config.toml` 并填写账号信息。
+2. 双击 `better-yzu-campus-network.exe`，窗口显示配置路径及登录日志，自动登录任务随即开始。
+3. 点击 **隐藏到托盘**、窗口 **×** 或 **最小化**，窗口隐藏但后台任务不会停止。
+4. 单击或双击通知区域的小图标恢复窗口；也可右键图标选择 **打开窗口**。图标可能在任务栏右下角的 **“显示隐藏的图标”** 中。
+5. 需要真正结束程序时，点击窗口或托盘菜单中的 **退出**。退出会中断重连等待，在途网络请求结束后关闭程序，通常不超过 15 秒。
+
+> 配置缺失/错误会自动显示窗口；修改配置后请退出并重新启动。托盘创建失败时窗口会保持可见，防止程序隐藏后无法恢复。资源管理器重启后会尝试恢复图标。
+> 图形界面仅支持 Windows；Linux/macOS 保持命令行模式。请勿重复启动多个实例。
+
+```powershell
+# 启动后直接隐藏到托盘（可用于快捷方式或任务计划程序）
+.\better-yzu-campus-network.exe --minimized
+
+# 命令行模式：不创建图形窗口和托盘
+.\better-yzu-campus-network.exe --console
+```
+
+#### 命令行与配置路径
+
+Windows 图形模式默认读取 **程序所在目录**的 `config.toml`；`--console`、`--once` 和 Linux/macOS 默认读取 **当前工作目录**。显式 `--config` 优先，相对路径基于当前工作目录。
+
 ```bash
-# 使用当前目录下的 config.toml
+# Linux/macOS 命令行运行；Windows 不带参数则打开图形窗口
 ./better-yzu-campus-network
 
 # 指定配置文件路径
 ./better-yzu-campus-network --config /path/to/config.toml
 
-# 只尝试登录一次后退出（调试用）
+# 只尝试登录一次后退出，不创建窗口（调试用）
 ./better-yzu-campus-network --once
 
 # 查看帮助
 ./better-yzu-campus-network --help
 ```
+
+`--minimized` 仅支持 Windows，不能与 `--console` 或 `--once` 一起使用。Windows 程序采用 GUI 子系统；在脚本中需要等待其结束时，可使用 `Start-Process -Wait`。
 
 #### 后台常驻
 
@@ -80,25 +116,27 @@ Linux / macOS：
 nohup ./better-yzu-campus-network > yzu.log 2>&1 &
 ```
 
-Windows（开机自启可在“任务计划程序”里添加触发器）：
-
-```powershell
-Start-Process -WindowStyle Hidden .\better-yzu-campus-network.exe
-```
+Windows 可在“任务计划程序”中配置启动程序与 `--minimized` 参数，选择 **仅当用户登录时运行**，以便显示托盘图标；无需再使用 `-WindowStyle Hidden`。
 
 -----
 
 ### 4\. 项目结构
 
 ```
-Cargo.toml               依赖与构建配置
-config.example.toml      配置模板（提交到仓库）
-config.toml              你的真实配置（不提交）
+Cargo.toml                   依赖与构建配置
+config.example.toml          配置模板（提交到仓库）
+config.toml                  你的真实配置（不提交）
 src/
-  main.rs                入口：读取配置、主循环、参数解析
-  config.rs              Config 结构体、加载与校验
-  login.rs               网关参数解析与登录请求
-.github/workflows/ci.yml 编译、检查与冒烟测试
+  main.rs                    参数解析与 GUI / 命令行入口
+  windows_ui.rs              Windows 窗口、托盘、隐藏/恢复/退出
+  worker.rs                  后台登录循环与可中断等待
+  logging.rs                 有界日志与敏感信息遮蔽
+  config.rs                  Config 结构体、加载与校验
+  login.rs                   网关参数解析与登录请求
+.github/
+  scripts/windows-smoke.py   Windows 窗口与命令行自动化冒烟
+  workflows/ci.yml           三平台编译、单元测试、clippy 与冒烟测试
+  workflows/release.yml      打 v* tag 时测试并构建四种架构发行包
 ```
 
 -----

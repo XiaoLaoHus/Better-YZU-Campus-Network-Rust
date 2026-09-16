@@ -25,15 +25,9 @@ pub const YZU_INITIAL_URL: &str = "https://sso.yzu.edu.cn/login?service=http:%2F
 const GET_TIMEOUT: Duration = Duration::from_secs(5);
 const POST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// 输出一条通知。原脚本的 `duration` 参数只用于控制横幅停留时间，本身未被使用，故删去。
+/// 输出到控制台，或 Windows 窗口的有界日志队列。
 pub fn show_msg(msg: &str) {
-    println!("[通知] {msg}");
-}
-
-/// 打印启动/连接失败原因后退出。
-pub fn show_msg_and_exit(msg: &str) -> ! {
-    show_msg(msg);
-    std::process::exit(1);
+    crate::logging::message(msg);
 }
 
 /// 构建全局共用的 HTTP 客户端。
@@ -163,18 +157,14 @@ pub fn login_attempt(client: &Client, config: &Config) -> Result<(), LoginError>
         .send()
         .map_err(LoginError::from_reqwest)?;
 
-    // 必须先取文本再解析：原脚本在 JSON 解析失败时会打印 `res.text` 帮助调试，
-    // 因此不能直接消费响应体成 JSON
+    // 先获取响应文本，再解析网关 JSON；原始响应不写入日志，避免泄露认证信息。
     let text = res.text().map_err(LoginError::from_reqwest)?;
 
     let res_json: serde_json::Value = match serde_json::from_str(&text) {
         Ok(value) => value,
         Err(_) => {
             show_msg("登录失败：服务器响应格式错误。可能原因：您正处于断网状态，且网关返回了非标准错误页面。");
-            println!(
-                "原始响应文本: {}",
-                if text.is_empty() { "<EMPTY RESPONSE>" } else { &text }
-            );
+            // 原始响应可能包含认证信息，不写入 GUI 或控制台日志。
             return Ok(());
         }
     };
@@ -188,7 +178,7 @@ pub fn login_attempt(client: &Client, config: &Config) -> Result<(), LoginError>
                 .unwrap_or("未知错误");
             show_msg(&format!("登录失败: {message}"));
         }
-        _ => show_msg(&format!("登录响应异常: {text}")),
+        _ => show_msg("登录响应异常：缺少有效的 result 字段。"),
     }
 
     Ok(())

@@ -52,7 +52,7 @@ impl Config {
 
         toml::from_str(&contents).map_err(|source| ConfigError::Parse {
             path: path.to_path_buf(),
-            source,
+            source: Box::new(source),
         })
     }
 
@@ -84,7 +84,8 @@ pub enum ConfigError {
     /// 配置文件存在但格式不对
     Parse {
         path: PathBuf,
-        source: toml::de::Error,
+        /// 装箱以免 `ConfigError` 过大触发 clippy::result_large_err
+        source: Box<toml::de::Error>,
     },
     /// user_id 或 password 为空
     MissingCredentials,
@@ -103,8 +104,9 @@ impl fmt::Display for ConfigError {
                 path.display(),
                 CONFIG_FILE
             ),
-            ConfigError::Parse { path, source } => {
-                write!(f, "配置文件 {} 格式错误: {source}", path.display())
+            ConfigError::Parse { path, .. } => {
+                // toml 错误的 Display 会包含原始配置行，可能泄露密码。
+                write!(f, "配置文件 {} 格式错误，请检查 TOML 语法和字段类型。", path.display())
             }
             ConfigError::MissingCredentials => write!(
                 f,
@@ -125,8 +127,53 @@ impl Error for ConfigError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             ConfigError::Read { source, .. } => Some(source),
-            ConfigError::Parse { source, .. } => Some(source),
+            ConfigError::Parse { source, .. } => Some(&**source),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid() -> Config {
+        toml::from_str("user_id = 'test-user'\npassword = 'test-password'\nservice_index = 1").unwrap()
+    }
+
+    #[test]
+    fn defaults_and_valid_services() {
+        let mut config = valid();
+        assert_eq!(config.interval_secs, 600);
+        assert!(!config.danger_accept_invalid_certs);
+        for service in 1..=SERVICE_COUNT {
+            config.service_index = service;
+            assert!(config.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_configuration() {
+        let mut config = valid();
+        config.user_id = "  ".into();
+        assert!(matches!(config.validate(), Err(ConfigError::MissingCredentials)));
+        config = valid();
+        config.password.clear();
+        assert!(config.validate().is_err());
+        config = valid();
+        for service in [0, SERVICE_COUNT + 1] {
+            config.service_index = service;
+            assert!(matches!(config.validate(), Err(ConfigError::InvalidServiceIndex(_))));
+        }
+        config = valid();
+        config.interval_secs = 0;
+        assert!(matches!(config.validate(), Err(ConfigError::IntervalTooSmall)));
+    }
+
+    #[test]
+    fn parse_error_does_not_display_credentials() {
+        let source = toml::from_str::<Config>("password = secret-password").unwrap_err();
+        let error = ConfigError::Parse { path: "config.toml".into(), source: Box::new(source) };
+        assert!(!error.to_string().contains("secret-password"));
     }
 }

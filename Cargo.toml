@@ -1,6 +1,6 @@
 [package]
 name = "better-yzu-campus-network"
-version = "1.0.5"
+version = "1.0.6"
 edition = "2021"
 description = "扬州大学校园网自动登录和断线重连脚本"
 license = "MIT"

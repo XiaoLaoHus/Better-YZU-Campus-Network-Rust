@@ -28,6 +28,13 @@ const SSO_HOST: &str = "sso.yzu.edu.cn";
 /// 校园网门户主机（同时用于校验登录请求的去向）。
 const PORTAL_HOST: &str = "10.245.2.20";
 
+/// 会话参数特征。
+///
+/// 连接校园网时系统会弹出一个认证网页，**页面的地址本身就带着全部会话参数**
+/// （`wlanuserip`、`mac`、`nasip` 等）。这条特征用来把它和 SSO 登录页区分开：
+/// 前者参数就在地址里，后者参数藏在 `service` 参数内。
+const SESSION_MARKER: &str = "wlanuserip";
+
 /// 探测地址，按顺序尝试，命中即止。
 ///
 /// 会话参数（`wlanuserip`、`mac` 等）由网关按当次连接生成并做了私有加密，
@@ -141,17 +148,25 @@ fn resolve_location(base: &str, location: &str) -> Option<String> {
     Url::parse(base).ok()?.join(location).ok().map(|url| url.to_string())
 }
 
-/// 从重定向地址中识别 SSO 登录入口。
+/// 地址本身是否就是「带会话参数的门户页地址」。
 ///
-/// 未认证时网关把请求重定向到 SSO 登录页；已认证时重定向到门户的成功页，
-/// 此时返回 `None`。
+/// SSO 登录页的 `service` 参数里也会出现同样这些参数名（百分号编码不影响字母），
+/// 所以要一并排除，避免把 SSO 页误判成门户页。
+fn is_session_url(url: &str) -> bool {
+    url.contains(SESSION_MARKER) && !url.contains(SSO_HOST)
+}
+
+/// 识别可用的认证入口，返回原地址。
 ///
-/// 识别条件收敛为两条，避免把外网的任意跳转误当成认证入口：
-/// 主机是校园 SSO，或 `service` 参数指向校园门户。
-fn sso_url_from_location(location: &str) -> Option<String> {
-    let parsed = Url::parse(location).ok()?;
+/// 实测入口有两种形态，都在这里统一认下：
+/// - **SSO 登录页**：未认证时网关把请求重定向过去，参数藏在 `service` 里；
+/// - **门户页地址**：连接校园网时系统弹出的那个认证网页，参数就在地址本身。
+///
+/// 已认证时重定向目标是门户成功页，两种都不匹配，返回 `None`。
+fn entry_from_url(url: &str) -> Option<String> {
+    let parsed = Url::parse(url).ok()?;
     if parsed.host_str() == Some(SSO_HOST) {
-        return Some(location.to_string());
+        return Some(url.to_string());
     }
 
     // 认证页也可能挂在别的域名下，此时以 `service` 参数指向门户为准
@@ -160,12 +175,16 @@ fn sso_url_from_location(location: &str) -> Option<String> {
         .find(|(key, _)| key == "service")
         .and_then(|(_, value)| Url::parse(&value).ok())
         .is_some_and(|target| target.host_str() == Some(PORTAL_HOST));
-
     if points_to_portal {
-        Some(location.to_string())
-    } else {
-        None
+        return Some(url.to_string());
     }
+
+    // 门户页地址：只认内网主机，否则一个外网页面上的同名参数就能把密码引出去
+    if is_session_url(url) && parsed.host_str().is_some_and(is_private_host) {
+        return Some(url.to_string());
+    }
+
+    None
 }
 
 /// 探测结果。
@@ -173,34 +192,34 @@ fn sso_url_from_location(location: &str) -> Option<String> {
 /// 区分「已在线」和「没找到入口」两种落空情况，是为了给出准确的提示：
 /// 前者无需处理，后者往往说明探测方式对该网络不适用。
 enum Discovery {
-    /// 拿到 SSO 认证入口
-    Sso(String),
+    /// 拿到认证入口
+    Entry(String),
     /// 网关明确表示已认证
     Online,
     /// 网关有响应，但没有认证入口，也没看到成功页
     NoEntry,
 }
 
-/// 从响应正文里找出首个指向 SSO 的地址。
+/// 在文本里切出围绕首个 `marker` 出现的那个地址。
 ///
-/// 有些网关不用 302，而是返回 200 加一个内嵌认证链接的门户兜底页，此时跳转地址
+/// 有些网关不用 302，而是返回 200 加一个内嵌认证链接的门户兜底页，此时入口
 /// 只能从正文里取。正文里的查询参数是 HTML 转义的（`&amp;`），取出后必须还原，
 /// 否则拼进 `queryString` 的参数会错。
-fn sso_url_from_body(body: &str) -> Option<String> {
-    let start = body.find(SSO_HOST)?;
+fn url_around(text: &str, marker: &str) -> Option<String> {
+    let start = text.find(marker)?;
 
     // 向前回溯到 URL 起点：上一个分隔符之后。分隔符只取单字节字符，
     // 避免在多字节字符中间切片。
     const DELIMITERS: [char; 8] = ['"', '\'', '(', ')', '<', '>', ' ', '\n'];
-    let begin = body[..start]
+    let begin = text[..start]
         .rfind(DELIMITERS)
         .map_or(0, |index| index + 1);
 
     // 向后找到 URL 结束：下一个分隔符之前
-    let tail = &body[start..];
+    let tail = &text[start..];
     let end = tail.find(DELIMITERS).unwrap_or(tail.len());
 
-    let candidate = &body[begin..start + end];
+    let candidate = &text[begin..start + end];
     // 协议相对地址（`//host/path`）协议头要补齐
     if candidate.starts_with("//") {
         return Some(format!("https:{candidate}").replace("&amp;", "&"));
@@ -211,8 +230,17 @@ fn sso_url_from_body(body: &str) -> Option<String> {
     Some(candidate.replace("&amp;", "&"))
 }
 
-/// 顺着网关的重定向链取回本次会话的 SSO 入口地址。
-fn discover_sso_url(client: &Client) -> Result<Discovery, LoginError> {
+/// 从响应正文里找出首个可用认证入口。
+///
+/// 依次按 SSO 域名、会话参数特征定位，返回第一个能通过 `entry_from_url` 的地址。
+fn auth_url_from_text(text: &str) -> Option<String> {
+    [SSO_HOST, SESSION_MARKER]
+        .into_iter()
+        .find_map(|marker| url_around(text, marker).filter(|url| entry_from_url(url).is_some()))
+}
+
+/// 顺着网关的重定向链取回本次会话的认证入口。
+fn discover_entry(client: &Client) -> Result<Discovery, LoginError> {
     let mut responded = false;
     let mut saw_online_hint = false;
     let mut last_error = None;
@@ -261,12 +289,15 @@ fn discover_sso_url(client: &Client) -> Result<Discovery, LoginError> {
                     buffer.len()
                 ));
 
-                if let Some(url) = sso_url_from_body(&body) {
-                    if sso_url_from_location(&url).is_some() {
-                        show_msg(&format!("  正文中找到认证入口 → {}", redact(&url)));
-                        return Ok(Discovery::Sso(url));
-                    }
-                    show_msg(&format!("  正文中的 SSO 链接不合格，已忽略 → {}", redact(&url)));
+                if let Some(url) = auth_url_from_text(&body) {
+                    show_msg(&format!("  正文中找到认证入口 → {}", redact(&url)));
+                    return Ok(Discovery::Entry(url));
+                }
+                // 有链接但用不上：把地址脱敏后打出来，方便对着排查
+                if let Some(url) = url_around(&body, SESSION_MARKER)
+                    .or_else(|| url_around(&body, SSO_HOST))
+                {
+                    show_msg(&format!("  正文中的链接不可用，已忽略 → {}", redact(&url)));
                 }
                 break;
             };
@@ -279,9 +310,9 @@ fn discover_sso_url(client: &Client) -> Result<Discovery, LoginError> {
             };
             show_msg(&format!("  HTTP {status}，跳转 → {}", redact(&next)));
 
-            if sso_url_from_location(&next).is_some() {
+            if entry_from_url(&next).is_some() {
                 show_msg("找到认证入口，正在获取本次会话参数...");
-                return Ok(Discovery::Sso(next));
+                return Ok(Discovery::Entry(next));
             }
             if next.contains(ONLINE_HINT) {
                 show_msg("  网关返回认证成功页，判断为已在线");
@@ -307,15 +338,22 @@ fn build_detect_client() -> Result<Client, LoginError> {
         .map_err(|error| LoginError::Unexpected(format!("无法创建探测客户端: {error}")))
 }
 
-/// 解析认证服务器信息。对应原脚本的 `get_redirect_info`。
-fn get_redirect_info(client: &Client, initial_sso_url: &str) -> Result<RedirectInfo, LoginError> {
-    show_msg("正在解析认证服务器信息...");
-
-    let parsed = Url::parse(initial_sso_url)
-        .map_err(|e| LoginError::Flow(format!("无法解析 SSO 入口 URL: {e}")))?;
+/// 从认证入口里取出「带会话参数的门户地址」。
+///
+/// 入口有两种形态，统一成后者再交给 `get_redirect_info`：
+/// - SSO 登录页：会话参数在 `service` 参数里；
+/// - 门户页地址：连接校园网时浏览器被弹到的那个页面，参数就在地址本身。
+fn service_url_from_entry(entry: &str) -> Result<String, LoginError> {
+    // 入口本身就是弹窗页地址：参数已经在地址里，直接用
+    if is_session_url(entry) {
+        return Ok(entry.to_string());
+    }
 
     // `query_pairs` 会自动做百分号解码，等价于 Python 的 `urllib.parse.parse_qs`
-    let new_url = parsed
+    let parsed =
+        Url::parse(entry).map_err(|e| LoginError::Flow(format!("无法解析认证入口 URL: {e}")))?;
+
+    parsed
         .query_pairs()
         .find(|(key, _)| key == "service")
         .map(|(_, value)| value.into_owned())
@@ -323,12 +361,16 @@ fn get_redirect_info(client: &Client, initial_sso_url: &str) -> Result<RedirectI
             LoginError::Flow(
                 "意外错误，请联系原作者github:https://github.com/GUMOUXUAN".to_string(),
             )
-        })?;
+        })
+}
 
+/// 解析认证服务器信息。对应原脚本的 `get_redirect_info`。
+fn get_redirect_info(client: &Client, new_url: &str) -> Result<RedirectInfo, LoginError> {
+    show_msg("正在解析认证服务器信息...");
     show_msg("正在获取参数desuwa...");
 
-    let parsed_new_url = Url::parse(&new_url)
-        .map_err(|e| LoginError::Flow(format!("无法解析跳转 URL: {e}")))?;
+    let parsed_new_url =
+        Url::parse(new_url).map_err(|e| LoginError::Flow(format!("无法解析跳转 URL: {e}")))?;
 
     let ip = parsed_new_url.host_str().unwrap_or_default();
 
@@ -341,7 +383,7 @@ fn get_redirect_info(client: &Client, initial_sso_url: &str) -> Result<RedirectI
             // 地址里含个人参数，写日志前先脱敏。
             return Err(LoginError::Flow(format!(
                 "无法从解析出的 URL 中提取 IP 或 QueryString。当前URL: {}",
-                redact(&new_url)
+                redact(new_url)
             )));
         }
     };
@@ -358,7 +400,7 @@ fn get_redirect_info(client: &Client, initial_sso_url: &str) -> Result<RedirectI
 
     // 与原脚本一致：先 GET 一次认证页，让网关下发会话 Cookie
     client
-        .get(&new_url)
+        .get(new_url)
         .timeout(GET_TIMEOUT)
         .send()
         .map_err(LoginError::from_reqwest)?;
@@ -366,7 +408,7 @@ fn get_redirect_info(client: &Client, initial_sso_url: &str) -> Result<RedirectI
     Ok(RedirectInfo {
         login_url,
         query_string: query_string.to_string(),
-        referer: new_url,
+        referer: new_url.to_string(),
     })
 }
 
@@ -381,8 +423,8 @@ pub fn login_attempt(client: &Client, config: &Config) -> Result<(), LoginError>
     }
 
     // 会话参数每次现取，源码里不再保留任何个人设备信息。
-    let sso_url = match discover_sso_url(&build_detect_client()?)? {
-        Discovery::Sso(url) => url,
+    let entry = match discover_entry(&build_detect_client()?)? {
+        Discovery::Entry(entry) => entry,
         Discovery::Online => {
             show_msg("当前已在线，跳过本次登录。");
             return Ok(());
@@ -395,7 +437,10 @@ pub fn login_attempt(client: &Client, config: &Config) -> Result<(), LoginError>
         }
     };
 
-    let info = get_redirect_info(client, &sso_url)?;
+    // 弹窗页地址直接就是参数串；SSO 入口则还要把 `service` 参数解出来。
+    // 统一成「带会话参数的门户地址」再交给下面解析。
+    let service_url = service_url_from_entry(&entry)?;
+    let info = get_redirect_info(client, &service_url)?;
 
     show_msg("正在尝试登录...");
 
@@ -502,24 +547,50 @@ mod tests {
     fn detects_sso_entry_from_redirect_location() {
         let sso =
             "https://sso.yzu.edu.cn/login?service=http%3A%2F%2F10.245.2.20%2Feportal%2Findex.jsp";
-        assert_eq!(sso_url_from_location(sso).as_deref(), Some(sso));
-        assert!(sso_url_from_location("https://sso.yzu.edu.cn/login").is_some());
+        assert_eq!(entry_from_url(sso).as_deref(), Some(sso));
+        assert!(entry_from_url("https://sso.yzu.edu.cn/login").is_some());
         // 认证页也可能挂在别的域名下，此时以 service 参数指向门户为准
         let other_host = "http://gw.example/auth?service=http%3A%2F%2F10.245.2.20%2Feportal";
-        assert!(sso_url_from_location(other_host).is_some());
+        assert!(entry_from_url(other_host).is_some());
+    }
+
+    #[test]
+    fn detects_portal_page_url_as_entry() {
+        // 连接校园网时弹出的认证页：会话参数就在地址本身，不需要再解 service
+        let popup = "http://10.245.2.20/eportal/index.jsp?wlanuserip=SECRET&wlanacname=x&ssid=&nasip=y&mac=SECRETMAC&t=wireless-v2&url=z";
+        assert_eq!(entry_from_url(popup).as_deref(), Some(popup));
+        assert_eq!(service_url_from_entry(popup).unwrap(), popup);
+        // SSO 页的 service 参数里也含同样的参数名，不能被误判成门户页
+        let sso = "https://sso.yzu.edu.cn/login?service=http%3A%2F%2F10.245.2.20%2Feportal%2Findex.jsp%3Fwlanuserip%3DSECRET";
+        assert!(!is_session_url(sso));
+        assert_eq!(
+            service_url_from_entry(sso).unwrap(),
+            "http://10.245.2.20/eportal/index.jsp?wlanuserip=SECRET"
+        );
+        // 外网页面上的同名参数不认：否则密码会被引到外部主机
+        assert!(entry_from_url("http://evil.example/x?wlanuserip=1").is_none());
     }
 
     #[test]
     fn ignores_redirects_that_are_not_the_auth_entry() {
         // 已认证时网关重定向到门户成功页，不是认证入口
         let success_page = "http://10.245.2.20/eportal/redirectortosuccess.jsp";
-        assert!(sso_url_from_location(success_page).is_none());
-        assert!(sso_url_from_location("").is_none());
-        assert!(sso_url_from_location("不是合法的 URL").is_none());
+        assert!(entry_from_url(success_page).is_none());
+        assert!(entry_from_url("").is_none());
+        assert!(entry_from_url("不是合法的 URL").is_none());
         // 外网地址即便带 service 参数也不算认证入口：否则一个伪造的跳转
         // 就能把密码引到外部主机
         let hostile = "http://evil.example/login?service=http%3A%2F%2Fevil.example%2F";
-        assert!(sso_url_from_location(hostile).is_none());
+        assert!(entry_from_url(hostile).is_none());
+    }
+
+    #[test]
+    fn finds_portal_page_url_in_response_body() {
+        // 有些网关不做跳转，直接把认证页正文返回来，地址在正文里
+        let body = r#"<html><script>window.location.href="http://10.245.2.20/eportal/index.jsp?wlanuserip=SECRET&mac=SECRETMAC";</script></html>"#;
+        let url = auth_url_from_text(body).expect("应从正文中取到入口");
+        assert!(url.starts_with("http://10.245.2.20/eportal/index.jsp?"));
+        assert!(service_url_from_entry(&url).is_ok());
     }
 
     #[test]
@@ -565,24 +636,24 @@ mod tests {
     fn extracts_sso_entry_from_portal_page_body() {
         // 网关不用 302 时，认证入口只在正文里
         let body = r#"<html><a href="https://sso.yzu.edu.cn/login?service=http%3A%2F%2F10.245.2.20%2Feportal%2Findex.jsp">登录</a></html>"#;
-        let url = sso_url_from_body(body).expect("应从正文中取到入口");
+        let url = auth_url_from_text(body).expect("应从正文中取到入口");
         assert!(url.starts_with("https://sso.yzu.edu.cn/login?service="));
-        assert!(sso_url_from_location(&url).is_some());
+        assert!(entry_from_url(&url).is_some());
     }
 
     #[test]
     fn unescapes_html_entities_in_body_url() {
         // 正文里的查询参数是 HTML 转义的，取出后要还原，否则参数会被拼错
         let body = r#"<a href="https://sso.yzu.edu.cn/login?service=http%3A%2F%2F10.245.2.20%2F&amp;t=wireless-v2">x</a>"#;
-        let url = sso_url_from_body(body).expect("应从正文中取到入口");
+        let url = auth_url_from_text(body).expect("应从正文中取到入口");
         assert!(!url.contains("&amp;"));
         assert!(url.contains("&t=wireless-v2"));
     }
 
     #[test]
     fn ignores_body_without_a_usable_sso_link() {
-        assert!(sso_url_from_body("<html>普通页面</html>").is_none());
+        assert!(auth_url_from_text("<html>普通页面</html>").is_none());
         // 出现 SSO 域名但不是地址形式时不应误判
-        assert!(sso_url_from_body("联系 sso.yzu.edu.cn 管理员").is_none());
+        assert!(auth_url_from_text("联系 sso.yzu.edu.cn 管理员").is_none());
     }
 }

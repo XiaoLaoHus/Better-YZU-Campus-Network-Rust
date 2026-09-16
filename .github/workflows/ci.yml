@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: better-yzu-campus-network
+
+jobs:
+  build-and-run:
+    name: 编译并运行
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: 缓存依赖与构建产物
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # 编译放最前面：编译错误是最需要优先暴露的问题
+      - name: cargo build --release
+        run: cargo build --release --verbose
+
+      # clippy 与 fmt 暂不阻塞构建，先拿到信号
+      - name: cargo clippy（仅供参考，不阻塞）
+        continue-on-error: true
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo fmt --check
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      - name: 生成测试用 config.toml
+        run: |
+          cp config.example.toml config.toml
+          sed -i 's/^user_id = ""/user_id = "ci-test-user"/' config.toml
+          sed -i 's/^password = ""/password = "ci-test-password"/' config.toml
+          cat config.toml
+
+      - name: 运行（--once，单次尝试后退出）
+        run: |
+          set -o pipefail
+          timeout 120 "./target/release/${BIN_NAME}" --once | tee run.log
+          echo "退出码: $?"
+
+      - name: 校验输出
+        run: |
+          # 启动横幅出现，说明配置读取、校验、HTTP 客户端构建都正常
+          grep -q "启动了喵" run.log || { echo "❌ 未看到启动横幅"; exit 1; }
+          echo "✅ 启动正常"
+
+          # 网关是校园内网地址，GitHub runner 连不上属于预期情况
+          if grep -q "网络连接错误" run.log; then
+            echo "ℹ️ 无法连通校园网关（预期行为：CI 环境不在校内网）"
+          fi
+
+          # 帮助信息应当可用
+          "./target/release/${BIN_NAME}" --help
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BIN_NAME }}-linux-x86_64
+          path: target/release/${{ env.BIN_NAME }}
+          if-no-files-found: error

@@ -1,0 +1,22 @@
+# 复制本文件为 config.toml 并填写你的真实信息
+# config.toml 已被 .gitignore 忽略，不会提交到 git
+
+# 你的学工号 / 统一身份认证账号
+user_id = ""
+
+# 你的校园网密码
+password = ""
+
+# 选择的网络服务，取值 1-5：
+#   1 = 学校互联网服务
+#   2 = 联通互联网服务
+#   3 = 移动互联网服务
+#   4 = 电信互联网服务
+#   5 = 校内免费服务（不常用）
+service_index = 2
+
+# 重连检查间隔（秒），原 Python 脚本为 600
+interval_secs = 600
+
+# 是否跳过 TLS 证书校验。默认 false，仅在使用自签名证书的网关时才需要开启
+danger_accept_invalid_certs = false

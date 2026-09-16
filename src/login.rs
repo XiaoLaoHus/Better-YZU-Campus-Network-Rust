@@ -94,7 +94,13 @@ fn redact(url: &str) -> String {
     let Ok(parsed) = Url::parse(url) else {
         return "<无法解析的地址>".to_string();
     };
-    let mut text = parsed[..url::Position::BeforeQuery].to_string();
+    // 显式拼装，不依赖 `Position` 切片的取址细节（`BeforeQuery` 实际含 `?`）。
+    let mut text = format!("{}://{}", parsed.scheme(), parsed.host_str().unwrap_or_default());
+    if let Some(port) = parsed.port() {
+        text.push_str(&format!(":{port}"));
+    }
+    text.push_str(parsed.path());
+
     let names: Vec<String> = parsed.query_pairs().map(|(key, _)| key.into_owned()).collect();
     if !names.is_empty() {
         text.push_str(&format!("?[{}]", names.join(",")));
@@ -439,6 +445,8 @@ mod tests {
         assert!(!safe.contains("SECRETMAC"));
         // 无参数时保持原样
         assert_eq!(redact("http://10.245.2.20/"), "http://10.245.2.20/");
+        // 带端口时端口要保留，且不能多出一个 `?`
+        assert_eq!(redact("http://10.245.2.20:8080/a?x=1"), "http://10.245.2.20:8080/a?[x]");
         assert_eq!(redact("不是合法的地址"), "<无法解析的地址>");
     }
 

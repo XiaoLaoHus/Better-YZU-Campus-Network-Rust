@@ -122,6 +122,14 @@ impl App {
         }
     }
 
+    /// 资源管理器重启后重新注册托盘图标；恢复失败就显示窗口，避免隐藏后找不回来。
+    fn refresh_tray(&self) {
+        if !self.controls.tray.borrow_mut().as_mut().unwrap().recreate() {
+            self.restore();
+            self.append("Windows 通知区域重启后未能恢复托盘图标，已显示窗口。");
+        }
+    }
+
     fn append(&self, message: &str) {
         let mut logs = self.logs.borrow_mut();
         logs.push(message);
@@ -381,12 +389,7 @@ pub fn run(path: PathBuf, minimized: bool) -> Result<(), Box<dyn Error>> {
                 }
                 return Some(0);
             }
-            _ if msg == taskbar_created => {
-                if !app.controls.tray.borrow_mut().as_mut().unwrap().recreate() {
-                    app.restore();
-                    app.append("Windows 通知区域重启后未能恢复托盘图标，已显示窗口。");
-                }
-            }
+            _ if msg == taskbar_created => app.refresh_tray(),
             _ => {}
         }
         None

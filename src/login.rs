@@ -32,13 +32,25 @@ const PORTAL_HOST: &str = "10.245.2.20";
 /// 会话参数（`wlanuserip`、`mac` 等）由网关按当次连接生成并做了私有加密，
 /// 无法本地推算，只能在重定向链里现取；它们绑定具体设备，不适合硬编码进源码。
 ///
-/// 用外网 HTTP 地址而不是门户本身来触发：未认证时网关会拦截对外请求并重定向到
-/// SSO，认证参数就是在这一步产生的；而直接访问门户主机时，网关往往直接返回门户
-/// 页面（HTTP 200，不带跳转），拿不到任何入口。门户根地址作为兜底放在最后。
-const PROBE_URLS: [&str; 2] = [EXTERNAL_PROBE, "http://10.245.2.20/"];
+/// 顺序依据 2026-09-16 的校园网实测调整：
+/// - 门户主机可达，且确实会下发网关自己的跳转，放在最前；
+/// - `www.baidu.com` 在该网络下 DNS 解析失败（请求还没发出就报错），
+///   所以外网探测必须备一个 IP 字面量地址，域名只作为兜底。
+///
+/// 外网地址必须是 HTTP：HTTPS 无法被网关重定向。
+const PROBE_URLS: [&str; 3] = [PORTAL_PROBE, EXTERNAL_IP_PROBE, EXTERNAL_DNS_PROBE];
 
-/// 触发网关拦截的外网探测地址（必须是 HTTP：HTTPS 无法被网关重定向）。
-const EXTERNAL_PROBE: &str = "http://www.baidu.com/";
+/// 校园网门户根地址，网关必然可达。
+const PORTAL_PROBE: &str = "http://10.245.2.20/";
+
+/// 外网探测：IP 字面量，不需要 DNS。
+const EXTERNAL_IP_PROBE: &str = "http://223.5.5.5/";
+
+/// 外网探测：域名，依赖 DNS，实测在未认证时可能解析失败。
+const EXTERNAL_DNS_PROBE: &str = "http://www.baidu.com/";
+
+/// 网关表示「已认证」的成功页路径特征。
+const ONLINE_HINT: &str = "redirectortosuccess";
 
 /// 单次探测最多跟随的重定向次数。
 const MAX_REDIRECT_HOPS: usize = 3;
@@ -149,11 +161,23 @@ fn sso_url_from_location(location: &str) -> Option<String> {
     }
 }
 
-/// 顺着网关的重定向链取回本次会话的 SSO 入口地址。
+/// 探测结果。
 ///
-/// 返回 `Ok(None)` 表示网关有响应但没有给出认证入口，也就是当前已在线。
-fn discover_sso_url(client: &Client) -> Result<Option<String>, LoginError> {
+/// 区分「已在线」和「没找到入口」两种落空情况，是为了给出准确的提示：
+/// 前者无需处理，后者往往说明探测方式对该网络不适用。
+enum Discovery {
+    /// 拿到 SSO 认证入口
+    Sso(String),
+    /// 网关明确表示已认证
+    Online,
+    /// 网关有响应，但没有认证入口，也没看到成功页
+    NoEntry,
+}
+
+/// 顺着网关的重定向链取回本次会话的 SSO 入口地址。
+fn discover_sso_url(client: &Client) -> Result<Discovery, LoginError> {
     let mut responded = false;
+    let mut saw_online_hint = false;
     let mut last_error = None;
 
     for probe in PROBE_URLS {
@@ -195,17 +219,22 @@ fn discover_sso_url(client: &Client) -> Result<Option<String>, LoginError> {
 
             if sso_url_from_location(&next).is_some() {
                 show_msg("找到认证入口，正在获取本次会话参数...");
-                return Ok(Some(next));
+                return Ok(Discovery::Sso(next));
+            }
+            if next.contains(ONLINE_HINT) {
+                show_msg("  网关返回认证成功页，判断为已在线");
+                saw_online_hint = true;
             }
             current = next;
         }
     }
 
-    if responded {
-        Ok(None)
-    } else {
-        Err(last_error.unwrap_or_else(|| LoginError::Unexpected("无法探测网关".to_string())))
+    if !responded {
+        let error = last_error.unwrap_or_else(|| LoginError::Unexpected("无法探测网关".to_string()));
+        return Err(error);
     }
+
+    Ok(if saw_online_hint { Discovery::Online } else { Discovery::NoEntry })
 }
 
 /// 探测专用的客户端：必须关闭重定向跟随，否则读不到网关下发的 `Location`。
@@ -290,9 +319,18 @@ pub fn login_attempt(client: &Client, config: &Config) -> Result<(), LoginError>
     }
 
     // 会话参数每次现取，源码里不再保留任何个人设备信息。
-    let Some(sso_url) = discover_sso_url(&build_detect_client()?)? else {
-        show_msg("当前已在线或未接入校园网，跳过本次登录。");
-        return Ok(());
+    let sso_url = match discover_sso_url(&build_detect_client()?)? {
+        Discovery::Sso(url) => url,
+        Discovery::Online => {
+            show_msg("当前已在线，跳过本次登录。");
+            return Ok(());
+        }
+        Discovery::NoEntry => {
+            // 与「已在线」分开提示：这种情况往往说明探测方式对该网络不适用，
+            // 上面的探测日志是排查依据。
+            show_msg("未能从网关取到认证入口，跳过本次登录。若你确实处于断网状态，请保留上面的探测日志以便排查。");
+            return Ok(());
+        }
     };
 
     let info = get_redirect_info(client, &sso_url)?;

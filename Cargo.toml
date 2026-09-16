@@ -1,6 +1,6 @@
 [package]
 name = "better-yzu-campus-network"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "扬州大学校园网自动登录和断线重连脚本"
 license = "MIT"
@@ -11,6 +11,10 @@ url = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+native-windows-gui = { version = "1.0.13", default-features = false, features = ["menu", "cursor", "textbox"] }
+winapi = { version = "0.3", features = ["consoleapi", "wincon", "processenv", "winbase", "shellapi", "winuser"] }
 
 [profile.release]
 opt-level = "z"

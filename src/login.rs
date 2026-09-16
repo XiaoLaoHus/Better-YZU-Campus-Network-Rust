@@ -38,27 +38,22 @@ const SESSION_MARKER: &str = "wlanuserip";
 /// 探测地址，按顺序尝试，命中即止。
 ///
 /// 会话参数（`wlanuserip`、`mac` 等）由网关按当次连接生成并做了私有加密，
-/// 无法本地推算，只能在重定向链里现取；它们绑定具体设备，不适合硬编码进源码。
+/// 无法本地推算，只能在网关的应答里现取；它们绑定具体设备，不适合硬编码进源码。
 ///
-/// 顺序依据 2026-09-16 的校园网实测调整：
-/// - 门户主机可达，且确实会下发网关自己的跳转，放在最前；
-/// - `www.baidu.com` 在该网络下 DNS 解析失败（请求还没发出就报错），
-///   所以外网探测必须备一个 IP 字面量地址，域名只作为兜底。
+/// **只探外网地址**，依据 2026-09-16 的校园网实测：
+/// 未认证时网关会拦截去往外网的请求，把认证页（地址里带着全部会话参数）当正文返回来，
+/// 这正是浏览器弹窗拿到的那份内容。而校园网门户主机 `10.245.2.20` 属于内网、
+/// 不经过拦截，它只会按自己的导航逻辑 302 到 `redirectortosuccess.jsp` 再到自助服务页——
+/// **断网时也照样这么跳**，据此判断「已在线」是误报，所以不再探它。
 ///
-/// 外网地址必须是 HTTP：HTTPS 无法被网关重定向。
-const PROBE_URLS: [&str; 3] = [PORTAL_PROBE, EXTERNAL_IP_PROBE, EXTERNAL_DNS_PROBE];
+/// 地址必须是 HTTP：HTTPS 无法被网关拦截。
+const PROBE_URLS: [&str; 2] = [EXTERNAL_IP_PROBE, EXTERNAL_DNS_PROBE];
 
-/// 校园网门户根地址，网关必然可达。
-const PORTAL_PROBE: &str = "http://10.245.2.20/";
-
-/// 外网探测：IP 字面量，不需要 DNS。
+/// 外网探测：IP 字面量，不需要 DNS。实测劫持后返回 200 加认证页正文。
 const EXTERNAL_IP_PROBE: &str = "http://223.5.5.5/";
 
-/// 外网探测：域名，依赖 DNS，实测在未认证时可能解析失败。
+/// 外网探测：域名，依赖 DNS，实测在未认证时可能解析失败，仅作兜底。
 const EXTERNAL_DNS_PROBE: &str = "http://www.baidu.com/";
-
-/// 网关表示「已认证」的成功页路径特征。
-const ONLINE_HINT: &str = "redirectortosuccess";
 
 /// 无跳转时最多读取多少响应正文用于查找认证入口。
 ///
@@ -162,7 +157,8 @@ fn is_session_url(url: &str) -> bool {
 /// - **SSO 登录页**：未认证时网关把请求重定向过去，参数藏在 `service` 里；
 /// - **门户页地址**：连接校园网时系统弹出的那个认证网页，参数就在地址本身。
 ///
-/// 已认证时重定向目标是门户成功页，两种都不匹配，返回 `None`。
+/// 都不是时返回 `None`。注意门户的 `redirectortosuccess.jsp` 也算「都不是」——
+/// 实测这个网关未认证时同样会跳它，不能据此认定已在线。
 fn entry_from_url(url: &str) -> Option<String> {
     let parsed = Url::parse(url).ok()?;
     if parsed.host_str() == Some(SSO_HOST) {
@@ -189,14 +185,13 @@ fn entry_from_url(url: &str) -> Option<String> {
 
 /// 探测结果。
 ///
-/// 区分「已在线」和「没找到入口」两种落空情况，是为了给出准确的提示：
-/// 前者无需处理，后者往往说明探测方式对该网络不适用。
+/// 只有「拿到入口」和「没拿到」两种，刻意不再区分「已在线」：实测这个网关
+/// 在**未认证**时也会把门户请求跳到 `redirectortosuccess.jsp`，
+/// 任何基于该页面的「已在线」判断都是误报，会把用户带偏。
 enum Discovery {
     /// 拿到认证入口
     Entry(String),
-    /// 网关明确表示已认证
-    Online,
-    /// 网关有响应，但没有认证入口，也没看到成功页
+    /// 网关有响应，但没有认证入口
     NoEntry,
 }
 
@@ -242,7 +237,6 @@ fn auth_url_from_text(text: &str) -> Option<String> {
 /// 顺着网关的重定向链取回本次会话的认证入口。
 fn discover_entry(client: &Client) -> Result<Discovery, LoginError> {
     let mut responded = false;
-    let mut saw_online_hint = false;
     let mut last_error = None;
 
     for probe in PROBE_URLS {
@@ -314,10 +308,6 @@ fn discover_entry(client: &Client) -> Result<Discovery, LoginError> {
                 show_msg("找到认证入口，正在获取本次会话参数...");
                 return Ok(Discovery::Entry(next));
             }
-            if next.contains(ONLINE_HINT) {
-                show_msg("  网关返回认证成功页，判断为已在线");
-                saw_online_hint = true;
-            }
             current = next;
         }
     }
@@ -327,7 +317,7 @@ fn discover_entry(client: &Client) -> Result<Discovery, LoginError> {
         return Err(error);
     }
 
-    Ok(if saw_online_hint { Discovery::Online } else { Discovery::NoEntry })
+    Ok(Discovery::NoEntry)
 }
 
 /// 探测专用的客户端：必须关闭重定向跟随，否则读不到网关下发的 `Location`。
@@ -425,14 +415,9 @@ pub fn login_attempt(client: &Client, config: &Config) -> Result<(), LoginError>
     // 会话参数每次现取，源码里不再保留任何个人设备信息。
     let entry = match discover_entry(&build_detect_client()?)? {
         Discovery::Entry(entry) => entry,
-        Discovery::Online => {
-            show_msg("当前已在线，跳过本次登录。");
-            return Ok(());
-        }
         Discovery::NoEntry => {
-            // 与「已在线」分开提示：这种情况往往说明探测方式对该网络不适用，
-            // 上面的探测日志是排查依据。
-            show_msg("未能从网关取到认证入口，跳过本次登录。若你确实处于断网状态，请保留上面的探测日志以便排查。");
+            // 不武断地说「已在线」：这个网关断网时也会跳成功页，那种判断是误报。
+            show_msg("未能从网关取到认证入口，跳过本次登录。可能本机已在线；若确实断网，请保留上面的探测日志以便排查。");
             return Ok(());
         }
     };
@@ -573,7 +558,7 @@ mod tests {
 
     #[test]
     fn ignores_redirects_that_are_not_the_auth_entry() {
-        // 已认证时网关重定向到门户成功页，不是认证入口
+        // 门户成功页不是认证入口。断网时网关同样会跳这里，不能据此认为已在线
         let success_page = "http://10.245.2.20/eportal/redirectortosuccess.jsp";
         assert!(entry_from_url(success_page).is_none());
         assert!(entry_from_url("").is_none());

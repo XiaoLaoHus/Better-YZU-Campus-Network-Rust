@@ -122,6 +122,16 @@ impl fmt::Display for ConfigError {
     }
 }
 
+impl Error for ConfigError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ConfigError::Read { source, .. } => Some(source),
+            ConfigError::Parse { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,15 +174,5 @@ mod tests {
         let source = toml::from_str::<Config>("password = secret-password").unwrap_err();
         let error = ConfigError::Parse { path: "config.toml".into(), source };
         assert!(!error.to_string().contains("secret-password"));
-    }
-}
-
-impl Error for ConfigError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            ConfigError::Read { source, .. } => Some(source),
-            ConfigError::Parse { source, .. } => Some(source),
-            _ => None,
-        }
     }
 }

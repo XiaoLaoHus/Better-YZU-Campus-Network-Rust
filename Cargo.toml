@@ -14,7 +14,7 @@ toml = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 native-windows-gui = { version = "1.0.13", default-features = false, features = ["menu", "cursor", "textbox"] }
-winapi = { version = "0.3", features = ["consoleapi", "wincon", "processenv", "winbase", "shellapi", "winuser"] }
+winapi = { version = "0.3", features = ["consoleapi", "handleapi", "wincon", "processenv", "winbase", "shellapi", "winuser"] }
 
 [profile.release]
 opt-level = "z"

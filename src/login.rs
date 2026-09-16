@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt;
+use std::io::Read;
 use std::time::Duration;
 
 use reqwest::blocking::Client;
@@ -51,6 +52,12 @@ const EXTERNAL_DNS_PROBE: &str = "http://www.baidu.com/";
 
 /// 网关表示「已认证」的成功页路径特征。
 const ONLINE_HINT: &str = "redirectortosuccess";
+
+/// 无跳转时最多读取多少响应正文用于查找认证入口。
+///
+/// 实测网关可能返回 200 加一个内嵌认证链接的门户兜底页，入口只能从正文里找；
+/// 但正文可能很大（真实外网站点），只读开头即可。
+const MAX_BODY_BYTES: u64 = 32 * 1024;
 
 /// 单次探测最多跟随的重定向次数。
 const MAX_REDIRECT_HOPS: usize = 3;
@@ -174,6 +181,36 @@ enum Discovery {
     NoEntry,
 }
 
+/// 从响应正文里找出首个指向 SSO 的地址。
+///
+/// 有些网关不用 302，而是返回 200 加一个内嵌认证链接的门户兜底页，此时跳转地址
+/// 只能从正文里取。正文里的查询参数是 HTML 转义的（`&amp;`），取出后必须还原，
+/// 否则拼进 `queryString` 的参数会错。
+fn sso_url_from_body(body: &str) -> Option<String> {
+    let start = body.find(SSO_HOST)?;
+
+    // 向前回溯到 URL 起点：上一个分隔符之后。分隔符只取单字节字符，
+    // 避免在多字节字符中间切片。
+    const DELIMITERS: [char; 8] = ['"', '\'', '(', ')', '<', '>', ' ', '\n'];
+    let begin = body[..start]
+        .rfind(DELIMITERS)
+        .map_or(0, |index| index + 1);
+
+    // 向后找到 URL 结束：下一个分隔符之前
+    let tail = &body[start..];
+    let end = tail.find(DELIMITERS).unwrap_or(tail.len());
+
+    let candidate = &body[begin..start + end];
+    // 协议相对地址（`//host/path`）协议头要补齐
+    if candidate.starts_with("//") {
+        return Some(format!("https:{candidate}").replace("&amp;", "&"));
+    }
+    if !candidate.starts_with("http") {
+        return None;
+    }
+    Some(candidate.replace("&amp;", "&"))
+}
+
 /// 顺着网关的重定向链取回本次会话的 SSO 入口地址。
 fn discover_sso_url(client: &Client) -> Result<Discovery, LoginError> {
     let mut responded = false;
@@ -198,20 +235,45 @@ fn discover_sso_url(client: &Client) -> Result<Discovery, LoginError> {
             responded = true;
 
             let status = response.status().as_u16();
+            // 取成拥有所有权的字符串，后面读正文需要移动 response
             let location = response
                 .headers()
                 .get(LOCATION)
-                .and_then(|value| value.to_str().ok());
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
 
             let Some(location) = location else {
-                // 没有重定向：可能已在线，也可能这个地址本来就不需要认证。
-                show_msg(&format!("  HTTP {status}，无跳转"));
+                // 网关可能不用 302：实测它直接返回 200 加一个门户兜底页，
+                // 认证入口只能在正文里找。
+                let content_type = response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("未知类型")
+                    .to_string();
+
+                let mut buffer = Vec::new();
+                // 读超时也保留已读到的部分，不影响后续判断
+                let _ = response.take(MAX_BODY_BYTES).read_to_end(&mut buffer);
+                let body = String::from_utf8_lossy(&buffer);
+                show_msg(&format!(
+                    "  HTTP {status}，无跳转（{content_type}，{} 字节）",
+                    buffer.len()
+                ));
+
+                if let Some(url) = sso_url_from_body(&body) {
+                    if sso_url_from_location(&url).is_some() {
+                        show_msg(&format!("  正文中找到认证入口 → {}", redact(&url)));
+                        return Ok(Discovery::Sso(url));
+                    }
+                    show_msg(&format!("  正文中的 SSO 链接不合格，已忽略 → {}", redact(&url)));
+                }
                 break;
             };
 
             // 网关可能下发相对路径，必须按当前地址解析成绝对地址再跟下一步，
             // 否则下一轮请求会因为拿到非法地址而直接失败、链路断掉。
-            let Some(next) = resolve_location(&current, location) else {
+            let Some(next) = resolve_location(&current, &location) else {
                 show_msg(&format!("  HTTP {status}，跳转地址无法解析"));
                 break;
             };
@@ -497,5 +559,30 @@ mod tests {
         assert!(!is_private_host("8.8.8.8"));
         assert!(!is_private_host("evil.example"));
         assert!(!is_private_host(""));
+    }
+
+    #[test]
+    fn extracts_sso_entry_from_portal_page_body() {
+        // 网关不用 302 时，认证入口只在正文里
+        let body = r#"<html><a href="https://sso.yzu.edu.cn/login?service=http%3A%2F%2F10.245.2.20%2Feportal%2Findex.jsp">登录</a></html>"#;
+        let url = sso_url_from_body(body).expect("应从正文中取到入口");
+        assert!(url.starts_with("https://sso.yzu.edu.cn/login?service="));
+        assert!(sso_url_from_location(&url).is_some());
+    }
+
+    #[test]
+    fn unescapes_html_entities_in_body_url() {
+        // 正文里的查询参数是 HTML 转义的，取出后要还原，否则参数会被拼错
+        let body = r#"<a href="https://sso.yzu.edu.cn/login?service=http%3A%2F%2F10.245.2.20%2F&amp;t=wireless-v2">x</a>"#;
+        let url = sso_url_from_body(body).expect("应从正文中取到入口");
+        assert!(!url.contains("&amp;"));
+        assert!(url.contains("&t=wireless-v2"));
+    }
+
+    #[test]
+    fn ignores_body_without_a_usable_sso_link() {
+        assert!(sso_url_from_body("<html>普通页面</html>").is_none());
+        // 出现 SSO 域名但不是地址形式时不应误判
+        assert!(sso_url_from_body("联系 sso.yzu.edu.cn 管理员").is_none());
     }
 }

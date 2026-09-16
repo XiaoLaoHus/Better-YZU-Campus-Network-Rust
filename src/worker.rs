@@ -11,6 +11,11 @@ fn wait_for_stop(stop: &Receiver<()>, interval: Duration) -> bool {
 
 pub fn run(path: &Path, once: bool, stop: &Receiver<()>) -> Result<(), String> {
     let config = Config::load(path).map_err(|error| error.to_string())?;
+    run_config(config, once, stop)
+}
+
+/// GUI passes the saved snapshot so a later file edit cannot change a queued restart.
+pub fn run_config(config: Config, once: bool, stop: &Receiver<()>) -> Result<(), String> {
     config.validate().map_err(|error| error.to_string())?;
     crate::logging::set_secrets(&config.user_id, &config.password);
     show_msg("启动了喵...困困困喵");

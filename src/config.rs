@@ -3,7 +3,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// 可选网络服务的数量，对应 `login::SERVICE_LIST` 的长度
 pub const SERVICE_COUNT: usize = 5;
@@ -16,7 +16,7 @@ pub const EXAMPLE_CONFIG_FILE: &str = "config.example.toml";
 
 /// 用户配置。对应原 Python 脚本开头的 USER_ID / PASSWORD / SERVICE_INDEX，
 /// 外加两个可选的高级配置项。
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
     /// 学工号 / 统一身份认证账号
     pub user_id: String,
@@ -40,7 +40,57 @@ fn default_interval_secs() -> u64 {
     600
 }
 
+#[cfg(windows)]
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            user_id: String::new(),
+            password: String::new(),
+            service_index: 1,
+            interval_secs: default_interval_secs(),
+            danger_accept_invalid_certs: false,
+        }
+    }
+}
+
 impl Config {
+    /// Write a complete snapshot beside the destination, then atomically replace it.
+    /// Never truncate the working configuration if serialization / writing fails.
+    #[cfg(windows)]
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        use std::io::Write;
+        use std::os::windows::ffi::OsStrExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use winapi::um::winbase::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
+
+        self.validate().map_err(|error| error.to_string())?;
+        let contents = toml::to_string_pretty(self).map_err(|_| "无法序列化配置。".to_owned())?;
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let name = path.file_name().ok_or("配置路径必须指向文件。")?;
+        let mut temporary_name = name.to_os_string();
+        temporary_name.push(format!(".{}.{}.tmp", std::process::id(), stamp));
+        let temporary = path.with_file_name(temporary_name);
+        let mut created = false;
+        let result = (|| -> std::io::Result<()> {
+            let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+            created = true;
+            file.write_all(contents.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            let from: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
+            let to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        })();
+        if result.is_err() && created {
+            let _ = fs::remove_file(&temporary);
+        }
+        // No TOML text or credentials in the error channel.
+        result.map_err(|error| format!("保存失败：{error}。请检查配置目录是否存在且可写；原配置未改动。"))
+    }
+
     /// 从指定路径读取并解析配置。
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();

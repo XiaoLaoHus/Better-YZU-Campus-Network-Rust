@@ -57,7 +57,7 @@ def window_for(process):
     def collect(hwnd, _):
         pid = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if pid.value == process.pid and "v1.0.0" in text(hwnd):
+        if pid.value == process.pid and "扬州大学校园网 · v" in text(hwnd):
             found.append(hwnd)
         return True
 
@@ -95,8 +95,9 @@ def exercise(exe, config, minimized=False, missing=False):
     try:
         hwnd = wait_until(lambda: window_for(process), "GUI window creation")
         if missing:
-            wait_until(lambda: any("启动失败" in label for _, label in children(hwnd)), "visible config error")
-            assert user32.IsWindowVisible(hwnd), "Configuration errors must restore the window"
+            wait_until(lambda: any("欢迎使用" in label for _, label in children(hwnd)), "first-run configuration editor")
+            assert any(label == "保存并连接" for _, label in children(hwnd)), "First run must offer save and connect"
+            assert user32.IsWindowVisible(hwnd), "Missing configuration must show the editor"
         else:
             wait_until(lambda: any("启动了喵" in label for _, label in children(hwnd)), "worker logs")
             shell_available = bool(user32.FindWindowW("Shell_TrayWnd", None))

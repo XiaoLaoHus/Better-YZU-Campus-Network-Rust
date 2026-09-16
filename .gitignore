@@ -1,4 +1,7 @@
 /target
 
+# Claude Code 的本地会话与临时 worktree，不要提交
+.claude/
+
 # 真实配置文件（含账号密码），绝对不要提交
 config.toml

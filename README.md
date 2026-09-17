@@ -4,7 +4,7 @@
 * 本项目是原 [Python 单文件脚本](https://github.com/GUMOUXUAN/Better-YZU-Campus-Network) 的 Rust 重写版，原作者为GUMOUXUAN，使用 GitHub Actions 编译，可产出免运行时的单文件可执行程序。
 * 注意，此版本任何问题请在此项目发起 Issues 或联系此项目作者 XiaoLaoHus QQ:2576381123，不要在原作者下方询问，也不要联系原作者。
 * 由于本人几乎无 Rust 语言基础，本项目由本人用AI辅助完成，主要调用DeepSeek V4-flash 和 GPT 6-Astra，故可能存在大量问题，请谨慎使用。
-* 欢迎各位批评指导
+* 如果好用的话，麻烦给一个Star！欢迎各位批评指导！
 * 晚安！
 
 -----

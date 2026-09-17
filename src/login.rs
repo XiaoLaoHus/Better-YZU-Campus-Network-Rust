@@ -76,13 +76,13 @@ const POST_TIMEOUT: Duration = Duration::from_secs(10);
 /// 探测超时要短于登录请求：它只是连通性检查，且会叠加在退出时的等待时间上。
 const DETECT_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// 请求一律伪装成浏览器。
+/// 裸 socket 探针用的 User-Agent。
 ///
-/// 原版 Python 用 `httpx`，它**默认就会带** `User-Agent: python-httpx/x.y.z`；
-/// 而 reqwest 不设默认 UA，移植时源码里也从没手动加过，这个头就这样丢了。
-/// 网关很可能据此把不带 UA 的请求当成非浏览器流量掐掉，表现恰好就是
-/// `error sending request for url (...)`——TCP 层是通的、重试永远一样，
-/// 而浏览器手动访问却正常。用浏览器 UA 是为了跟已验证可用的浏览器行为对齐。
+/// **只给诊断探针用，不再设进 reqwest 客户端。** v2.0.2 曾把浏览器 UA 和一组
+/// 浏览器 Accept 头塞进探测客户端，理由是「网关可能掐掉不像浏览器的流量」；
+/// v2.0.3 的实测把这条否掉了：同一个进程、同一时刻，手写裸 HTTP 请求拿得到认证页
+/// （`HTTP/1.1 200 ok`，418 字节），而加了这些头的 hyper 请求反而被 peer 提前关闭。
+/// 探测客户端已回退到 v2.0.0 的裸配置（唯一实测可用的版本），这个常量留给探针做对照。
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 /// 裸 TCP 检查的超时。只用于给 HTTP 失败定性，不必等太久。
@@ -98,10 +98,9 @@ pub fn show_msg(msg: &str) {
 /// `cookie_store(true)` 是必须的：原脚本用同一个 `httpx.Client` 先 GET 认证页、
 /// 再 POST 登录，登录请求依赖 GET 阶段网关下发的会话 Cookie。
 ///
-/// `no_proxy()` 也是必须的：登录全程只跟网关打交道（认证页、登录接口都是内网地址），
-/// 不该经过代理。reqwest 默认会读系统代理设置，开机时 Clash 一类的服务常已把代理
-/// 指向 `127.0.0.1:7897` 而转发核心还没起来，请求会被拒成 `error sending request`；
-/// 浏览器因为走直连能正常弹认证页，所以「手动能开、软件不行」。
+/// **这里刻意保持 v2.0.0 的原样，不要再加东西。** v2.0.1 加过 `.no_proxy()`、
+/// v2.0.2 加过 `.user_agent()`，两次都让原本能登录的版本变得完全登不上，
+/// 见 `build_detect_client` 的说明。要证明某个改动确实必要，先拿到实测对比。
 pub fn build_client(config: &Config) -> Result<Client, reqwest::Error> {
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("*/*"));
@@ -116,8 +115,6 @@ pub fn build_client(config: &Config) -> Result<Client, reqwest::Error> {
     );
 
     Client::builder()
-        .no_proxy()
-        .user_agent(USER_AGENT)
         .cookie_store(true)
         .default_headers(headers)
         .danger_accept_invalid_certs(config.danger_accept_invalid_certs)
@@ -351,21 +348,14 @@ fn discover_entry(client: &Client) -> Result<Discovery, LoginError> {
 
 /// 探测专用的客户端：必须关闭重定向跟随，否则读不到网关下发的 `Location`。
 ///
-/// 同样要 `no_proxy()`：探测地址（外网 IP 与域名）必须由网关就地拦截并返回认证页，
-/// 一旦被送进代理，拦截就绕过去了，未认证时反而拿不到入口。
+/// **这里是 v2.0.0 的原样配置，一个字段都不要再加。** 2026-09-17 的实测对照：
+/// v2.0.0（本函数就是下面这三行）能正常登录，日志走到
+/// `HTTP 200，无跳转（未知类型，317 字节）` → `正文中找到认证入口` → `正在尝试登录...`；
+/// 而 v2.0.1 加了 `.no_proxy()`、v2.0.2 又加了 `.user_agent()` 和浏览器 Accept 头之后，
+/// 同一台机器完全登不上，报 `[请求] ← client error (SendRequest) ← connection closed
+/// before message completed`。既然没有任何证据要求这些字段，就别留在这里碰运气。
 fn build_detect_client() -> Result<Client, LoginError> {
-    let mut headers = HeaderMap::new();
-    // 浏览器导航式的 Accept。实测浏览器手动访问能拿到认证页，探测就按它那样发。
-    headers.insert(
-        ACCEPT,
-        HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"),
-    );
-    headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("zh-CN,zh;q=0.9"));
-
     Client::builder()
-        .no_proxy()
-        .user_agent(USER_AGENT)
-        .default_headers(headers)
         .redirect(Policy::none())
         .build()
         .map_err(|error| LoginError::Unexpected(format!("无法创建探测客户端: {error}")))
@@ -379,6 +369,12 @@ fn build_detect_client() -> Result<Client, LoginError> {
 /// - **手写请求同样被关** → 链路上确实有东西不接受这种流量，改请求头也没用。
 ///
 /// 只有亲手发字节才能分开这两条，所以这里不用任何 HTTP 库。
+///
+/// **2026-09-17 实测：这一问拿到了答案，是第一种。** 三个探测地址全都由裸请求拿到
+/// `HTTP/1.1 200 ok`（223.5.5.5 / baidu 各 418 字节，1.1.1.1 402 字节，响应头
+/// `Server,Content-Length,Cache-Control,Connection`），同一个进程同一时刻 hyper 却是
+/// `connection closed`。链路和网关都正常，所以方向是回退客户端配置而不是继续查网络——
+/// 这条探针留着：万一将来又失败，它能立刻把「网络坏了」和「我们改坏了」分开。
 ///
 /// 先按 HTTP/1.1 发，被关了就再试一次 HTTP/1.0 一并报出来——有些老中间设备只认其中一种。
 /// 只回报状态行和响应头**名**：正文和响应头里的值可能是带个人参数的认证页内容，不进日志。

@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
-use std::io::Read;
-use std::net::{TcpStream, ToSocketAddrs};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use reqwest::blocking::Client;
@@ -48,10 +48,16 @@ const SESSION_MARKER: &str = "wlanuserip";
 /// **断网时也照样这么跳**，据此判断「已在线」是误报，所以不再探它。
 ///
 /// 地址必须是 HTTP：HTTPS 无法被网关拦截。
-const PROBE_URLS: [&str; 2] = [EXTERNAL_IP_PROBE, EXTERNAL_DNS_PROBE];
+const PROBE_URLS: [&str; 3] = [EXTERNAL_IP_PROBE, EXTERNAL_ALT_IP_PROBE, EXTERNAL_DNS_PROBE];
 
 /// 外网探测：IP 字面量，不需要 DNS。实测劫持后返回 200 加认证页正文。
 const EXTERNAL_IP_PROBE: &str = "http://223.5.5.5/";
+
+/// 外网探测：另一个 IP 字面量（Cloudflare 公共 DNS）。
+///
+/// 跟 `EXTERNAL_IP_PROBE` 同类但目标不同：网关的拦截往往有白名单/黑名单差别，
+/// 一个地址被放行、另一个仍被拦是常见的，多备一个能提高命中率。
+const EXTERNAL_ALT_IP_PROBE: &str = "http://1.1.1.1/";
 
 /// 外网探测：域名，依赖 DNS，实测在未认证时可能解析失败，仅作兜底。
 const EXTERNAL_DNS_PROBE: &str = "http://www.baidu.com/";
@@ -270,9 +276,9 @@ fn discover_entry(client: &Client) -> Result<Discovery, LoginError> {
                 Err(error) => {
                     let error = LoginError::from_reqwest(error);
                     show_msg(&format!("  无法连接：{error}"));
-                    // 补一条裸 TCP 结果：TCP 也不通是网络层的问题，TCP 通则是 HTTP 层被拒，
-                    // 两者修法完全不同，这条能把下一次排查从猜测变成定位。
-                    show_msg(&format!("  {}", tcp_probe(&current)));
+                    // 补一条亲手发的裸 HTTP 结果：它能分开「链路上有东西在掐」与
+                    // 「hyper 发出的字节有问题」这两条岔路，修法完全不同。
+                    show_msg(&format!("  {}", raw_http_probe(&current)));
                     last_error = Some(error);
                     break;
                 }
@@ -365,34 +371,92 @@ fn build_detect_client() -> Result<Client, LoginError> {
         .map_err(|error| LoginError::Unexpected(format!("无法创建探测客户端: {error}")))
 }
 
-/// 裸 TCP 连一次探测地址，用来给 HTTP 失败定性。
+/// 亲手写一个 HTTP 请求发出去，完全绕开 reqwest 与 hyper。
 ///
-/// 只在 HTTP 请求已经失败之后补打一条。两种情况的原因和修法完全不同，不区分就只能瞎猜：
-/// - **TCP 也连不上**：网络层就不通（地址不可达、网关没放行）；
-/// - **TCP 连得上**：网络层是通的，问题出在 HTTP 层（被网关掐断、缺请求头）。
-fn tcp_probe(url: &str) -> String {
-    let Ok(parsed) = Url::parse(url) else { return "TCP 检查：地址无法解析".to_string() };
-    let Some(host) = parsed.host_str() else { return "TCP 检查：地址里没有主机名".to_string() };
+/// hyper 的报错是 `connection closed before message completed`：TCP 连上了，对端却在
+/// 响应头发完之前把连接关了。剩下的岔路只有两条，而它俩的修法完全不同：
+/// - **手写请求能拿到响应** → 链路和请求本身都没问题，毛病出在 hyper 这一层；
+/// - **手写请求同样被关** → 链路上确实有东西不接受这种流量，改请求头也没用。
+/// 只有亲手发字节才能分开这两条，所以这里不用任何 HTTP 库。
+///
+/// 先按 HTTP/1.1 发，被关了就再试一次 HTTP/1.0 一并报出来——有些老中间设备只认其中一种。
+/// 只回报状态行和响应头**名**：正文和响应头里的值可能是带个人参数的认证页内容，不进日志。
+fn raw_http_probe(url: &str) -> String {
+    let Ok(parsed) = Url::parse(url) else { return "手写 HTTP：地址无法解析".to_string() };
+    let Some(host) = parsed.host_str() else { return "手写 HTTP：地址里没有主机名".to_string() };
     let port = parsed.port_or_known_default().unwrap_or(80);
 
-    let Ok(addrs) = (host, port).to_socket_addrs() else {
-        return format!("TCP 检查：{host}:{port} 解析不出地址");
+    let mut path = parsed.path().to_string();
+    if let Some(query) = parsed.query() {
+        path.push('?');
+        path.push_str(query);
+    }
+    if path.is_empty() {
+        path.push('/');
+    }
+
+    let Ok(mut addrs) = (host, port).to_socket_addrs() else {
+        return format!("手写 HTTP：{host}:{port} 解析不出地址");
+    };
+    let Some(addr) = addrs.next() else {
+        return format!("手写 HTTP：{host}:{port} 没有可用地址");
     };
 
-    let mut last_error = None;
-    for addr in addrs {
-        match TcpStream::connect_timeout(&addr, TCP_PROBE_TIMEOUT) {
-            Ok(_) => {
-                return format!("TCP 检查：直连 {addr} 成功 → 网络层通，故障在 HTTP 层");
+    let http11 = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {USER_AGENT}\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+    );
+    let first = raw_http_request(&addr, &http11);
+    if first.starts_with("收到") {
+        return format!("手写 HTTP/1.1：{first}");
+    }
+
+    let http10 = format!("GET {path} HTTP/1.0\r\nUser-Agent: {USER_AGENT}\r\nAccept: */*\r\n\r\n");
+    format!("手写 HTTP/1.1：{first}；HTTP/1.0：{}", raw_http_request(&addr, &http10))
+}
+
+/// 按给定的请求文本裸发一次，回报状态行与响应头名。
+fn raw_http_request(addr: &SocketAddr, request: &str) -> String {
+    let mut stream = match TcpStream::connect_timeout(addr, TCP_PROBE_TIMEOUT) {
+        Ok(stream) => stream,
+        // 保留系统错误原文：连不上时它是唯一能说明原因的线索
+        Err(error) => return format!("{addr} 连不上（{error}）"),
+    };
+    let _ = stream.set_read_timeout(Some(TCP_PROBE_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(TCP_PROBE_TIMEOUT));
+
+    if let Err(error) = stream.write_all(request.as_bytes()) {
+        return format!("请求发不出去（{error}）");
+    }
+
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 512];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                buffer.extend_from_slice(&chunk[..read]);
+                // 读满头部边界就够定性了，不必等正文
+                if buffer.len() >= 1024 || buffer.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
             }
-            Err(error) => last_error = Some(error),
+            Err(error) => return format!("读响应失败（{error}），已收到 {} 字节", buffer.len()),
         }
     }
 
-    match last_error {
-        Some(error) => format!("TCP 检查：{host}:{port} 连不上 → 网络层不通（{error}）"),
-        None => format!("TCP 检查：{host}:{port} 没有可用地址"),
+    if buffer.is_empty() {
+        return "对端一个字都没回就关了连接".to_string();
     }
+
+    let text = String::from_utf8_lossy(&buffer);
+    let mut lines = text.lines();
+    let status = lines.next().unwrap_or_default().trim_end().to_string();
+    let names: Vec<&str> = lines
+        .take_while(|line| !line.trim().is_empty())
+        .filter_map(|line| line.split(':').next())
+        .map(str::trim)
+        .collect();
+    format!("收到 {} 字节，状态行「{status}」，响应头 [{}]", buffer.len(), names.join(","))
 }
 
 /// 把 `reqwest::Error` 展开成摘要加完整原因链。

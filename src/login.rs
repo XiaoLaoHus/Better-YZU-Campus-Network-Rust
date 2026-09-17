@@ -78,6 +78,11 @@ pub fn show_msg(msg: &str) {
 ///
 /// `cookie_store(true)` 是必须的：原脚本用同一个 `httpx.Client` 先 GET 认证页、
 /// 再 POST 登录，登录请求依赖 GET 阶段网关下发的会话 Cookie。
+///
+/// `no_proxy()` 也是必须的：登录全程只跟网关打交道（认证页、登录接口都是内网地址），
+/// 不该经过代理。reqwest 默认会读系统代理设置，开机时 Clash 一类的服务常已把代理
+/// 指向 `127.0.0.1:7897` 而转发核心还没起来，请求会被拒成 `error sending request`；
+/// 浏览器因为走直连能正常弹认证页，所以「手动能开、软件不行」。
 pub fn build_client(config: &Config) -> Result<Client, reqwest::Error> {
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("*/*"));
@@ -92,6 +97,7 @@ pub fn build_client(config: &Config) -> Result<Client, reqwest::Error> {
     );
 
     Client::builder()
+        .no_proxy()
         .cookie_store(true)
         .default_headers(headers)
         .danger_accept_invalid_certs(config.danger_accept_invalid_certs)
@@ -321,8 +327,12 @@ fn discover_entry(client: &Client) -> Result<Discovery, LoginError> {
 }
 
 /// 探测专用的客户端：必须关闭重定向跟随，否则读不到网关下发的 `Location`。
+///
+/// 同样要 `no_proxy()`：探测地址（外网 IP 与域名）必须由网关就地拦截并返回认证页，
+/// 一旦被送进代理，拦截就绕过去了，未认证时反而拿不到入口。
 fn build_detect_client() -> Result<Client, LoginError> {
     Client::builder()
+        .no_proxy()
         .redirect(Policy::none())
         .build()
         .map_err(|error| LoginError::Unexpected(format!("无法创建探测客户端: {error}")))

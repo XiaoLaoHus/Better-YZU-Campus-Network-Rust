@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::fmt;
 use std::io::Read;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use reqwest::blocking::Client;
@@ -69,6 +70,18 @@ const POST_TIMEOUT: Duration = Duration::from_secs(10);
 /// 探测超时要短于登录请求：它只是连通性检查，且会叠加在退出时的等待时间上。
 const DETECT_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// 请求一律伪装成浏览器。
+///
+/// 原版 Python 用 `httpx`，它**默认就会带** `User-Agent: python-httpx/x.y.z`；
+/// 而 reqwest 不设默认 UA，移植时源码里也从没手动加过，这个头就这样丢了。
+/// 网关很可能据此把不带 UA 的请求当成非浏览器流量掐掉，表现恰好就是
+/// `error sending request for url (...)`——TCP 层是通的、重试永远一样，
+/// 而浏览器手动访问却正常。用浏览器 UA 是为了跟已验证可用的浏览器行为对齐。
+const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+/// 裸 TCP 检查的超时。只用于给 HTTP 失败定性，不必等太久。
+const TCP_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// 输出到控制台，或 Windows 窗口的有界日志队列。
 pub fn show_msg(msg: &str) {
     crate::logging::message(msg);
@@ -98,6 +111,7 @@ pub fn build_client(config: &Config) -> Result<Client, reqwest::Error> {
 
     Client::builder()
         .no_proxy()
+        .user_agent(USER_AGENT)
         .cookie_store(true)
         .default_headers(headers)
         .danger_accept_invalid_certs(config.danger_accept_invalid_certs)
@@ -256,6 +270,9 @@ fn discover_entry(client: &Client) -> Result<Discovery, LoginError> {
                 Err(error) => {
                     let error = LoginError::from_reqwest(error);
                     show_msg(&format!("  无法连接：{error}"));
+                    // 补一条裸 TCP 结果：TCP 也不通是网络层的问题，TCP 通则是 HTTP 层被拒，
+                    // 两者修法完全不同，这条能把下一次排查从猜测变成定位。
+                    show_msg(&format!("  {}", tcp_probe(&current)));
                     last_error = Some(error);
                     break;
                 }
@@ -331,11 +348,80 @@ fn discover_entry(client: &Client) -> Result<Discovery, LoginError> {
 /// 同样要 `no_proxy()`：探测地址（外网 IP 与域名）必须由网关就地拦截并返回认证页，
 /// 一旦被送进代理，拦截就绕过去了，未认证时反而拿不到入口。
 fn build_detect_client() -> Result<Client, LoginError> {
+    let mut headers = HeaderMap::new();
+    // 浏览器导航式的 Accept。实测浏览器手动访问能拿到认证页，探测就按它那样发。
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"),
+    );
+    headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("zh-CN,zh;q=0.9"));
+
     Client::builder()
         .no_proxy()
+        .user_agent(USER_AGENT)
+        .default_headers(headers)
         .redirect(Policy::none())
         .build()
         .map_err(|error| LoginError::Unexpected(format!("无法创建探测客户端: {error}")))
+}
+
+/// 裸 TCP 连一次探测地址，用来给 HTTP 失败定性。
+///
+/// 只在 HTTP 请求已经失败之后补打一条。两种情况的原因和修法完全不同，不区分就只能瞎猜：
+/// - **TCP 也连不上**：网络层就不通（地址不可达、网关没放行）；
+/// - **TCP 连得上**：网络层是通的，问题出在 HTTP 层（被网关掐断、缺请求头）。
+fn tcp_probe(url: &str) -> String {
+    let Ok(parsed) = Url::parse(url) else { return "TCP 检查：地址无法解析".to_string() };
+    let Some(host) = parsed.host_str() else { return "TCP 检查：地址里没有主机名".to_string() };
+    let port = parsed.port_or_known_default().unwrap_or(80);
+
+    let Ok(addrs) = (host, port).to_socket_addrs() else {
+        return format!("TCP 检查：{host}:{port} 解析不出地址");
+    };
+
+    let mut last_error = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, TCP_PROBE_TIMEOUT) {
+            Ok(_) => {
+                return format!("TCP 检查：直连 {addr} 成功 → 网络层通，故障在 HTTP 层");
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    match last_error {
+        Some(error) => format!("TCP 检查：{host}:{port} 连不上 → 网络层不通（{error}）"),
+        None => format!("TCP 检查：{host}:{port} 没有可用地址"),
+    }
+}
+
+/// 把 `reqwest::Error` 展开成摘要加完整原因链。
+///
+/// `reqwest::Error` 的 `Display` 只给一行摘要（`error sending request for url (...)`），
+/// 真正的原因（连接被重置、DNS 失败、协议错误、系统错误码）全在 `source()` 链里。
+/// 只打摘要就分不清是网络层不通还是 HTTP 层被拒，只能反复猜——所以这条链必须打出来。
+fn describe(error: &reqwest::Error) -> String {
+    let mut text = error.to_string();
+
+    let mut kinds = Vec::new();
+    if error.is_timeout() { kinds.push("超时"); }
+    if error.is_connect() { kinds.push("连接"); }
+    if error.is_request() { kinds.push("请求"); }
+    if error.is_body() { kinds.push("正文"); }
+    if error.is_decode() { kinds.push("解码"); }
+    if error.is_redirect() { kinds.push("跳转"); }
+    if error.is_status() { kinds.push("状态码"); }
+    if error.is_builder() { kinds.push("构建"); }
+    if !kinds.is_empty() {
+        text.push_str(&format!(" [{}]", kinds.join("+")));
+    }
+
+    let mut cause = error.source();
+    while let Some(error) = cause {
+        text.push_str(&format!(" ← {error}"));
+        cause = error.source();
+    }
+    text
 }
 
 /// 从认证入口里取出「带会话参数的门户地址」。
@@ -508,7 +594,7 @@ impl LoginError {
         if error.is_timeout() || error.is_connect() {
             LoginError::Network(error)
         } else {
-            LoginError::Unexpected(error.to_string())
+            LoginError::Unexpected(describe(&error))
         }
     }
 }
@@ -518,7 +604,7 @@ impl fmt::Display for LoginError {
         match self {
             LoginError::Flow(message) => write!(f, "{message}"),
             LoginError::Network(error) => {
-                write!(f, "网络连接错误：可能未联网或服务器无响应。({error})")
+                write!(f, "网络连接错误：可能未联网或服务器无响应。({})", describe(error))
             }
             LoginError::Unexpected(message) => write!(f, "{message}"),
         }

@@ -16,6 +16,7 @@ import tomllib
 import urllib.request
 
 from pywinauto import Desktop, keyboard
+from pywinauto.uia_defines import NoPatternInterfaceError
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 CALLBACK = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -80,7 +81,13 @@ def control_for(window, name, control_type):
 def click(window, name):
     button = wait_until(lambda: control_for(window, name, "Button"), f"button {name}")
     wait_until(button.is_enabled, f"enabled button {name}")
-    button.invoke()
+    try:
+        button.invoke()
+    except NoPatternInterfaceError:
+        # 下拉框选项带选中态，accesskit 按 UIA 惯例对这类节点只暴露 Toggle
+        # 而不给 Invoke（is_invocable 里明确排除了有选中态的节点）。Toggle
+        # 内部仍投递 Action::Click，与读屏用户走的路径一致，不是绕过自动化。
+        button.toggle()
     time.sleep(0.2)
 
 

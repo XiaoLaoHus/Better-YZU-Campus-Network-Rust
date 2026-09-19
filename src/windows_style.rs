@@ -5,6 +5,9 @@ pub const CARD: Color32 = Color32::WHITE;
 pub const ACCENT: Color32 = Color32::from_rgb(36, 91, 196);
 pub const MUTED: Color32 = Color32::from_rgb(99, 110, 129);
 
+const INPUT_MARGIN: Margin = Margin::symmetric(12, 8);
+const INPUT_HEIGHT: f32 = 42.0;
+
 pub fn setup(ctx: &egui::Context) -> Result<(), String> {
     let root = std::env::var_os("WINDIR").map(std::path::PathBuf::from)
         .unwrap_or_else(|| "C:/Windows".into()).join("Fonts");
@@ -29,7 +32,7 @@ pub fn setup(ctx: &egui::Context) -> Result<(), String> {
     }
     style.spacing.item_spacing = egui::vec2(12.0, 10.0);
     style.spacing.button_padding = egui::vec2(16.0, 9.0);
-    style.spacing.interact_size.y = 42.0;
+    style.spacing.interact_size.y = INPUT_HEIGHT;
     style.text_styles.insert(TextStyle::Body, FontId::proportional(15.0));
     style.text_styles.insert(TextStyle::Button, FontId::proportional(15.0));
     style.text_styles.insert(TextStyle::Heading, FontId::proportional(26.0));
@@ -40,7 +43,7 @@ pub fn setup(ctx: &egui::Context) -> Result<(), String> {
 
 pub fn card() -> egui::Frame {
     egui::Frame::new().fill(CARD).corner_radius(14).inner_margin(Margin::same(20))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(230, 234, 242)))
+        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(230, 234, 242)))
 }
 
 pub fn primary(text: &str) -> egui::Button<'_> {
@@ -50,7 +53,7 @@ pub fn primary(text: &str) -> egui::Button<'_> {
 pub fn input<'a>(text: &'a mut String, id: &str, password: bool) -> egui::TextEdit<'a> {
     egui::TextEdit::singleline(text).id(egui::Id::new(id)).password(password)
         .horizontal_align(egui::Align::Center).vertical_align(egui::Align::Center)
-        .margin(Margin::symmetric(12, 8)).min_size(egui::vec2(0.0, 42.0))
+        .margin(INPUT_MARGIN).min_size(egui::vec2(0.0, INPUT_HEIGHT))
         .desired_width(f32::INFINITY)
 }
 
@@ -75,7 +78,9 @@ mod tests {
                             let center = output.response.rect.center();
                             assert!((text_center.x - center.x).abs() <= 1.0, "horizontal centering at {scale}x");
                             assert!((text_center.y - center.y).abs() <= 1.0, "vertical centering at {scale}x");
-                            assert!(output.response.rect.height() >= 42.0);
+                            // egui 0.31 的 TextEditOutput 返回的是去掉 margin 的内框，补回边距才是实际框高。
+                            let box_height = output.response.rect.height() + INPUT_MARGIN.sum().y;
+                            assert!(box_height >= INPUT_HEIGHT, "input box height at {scale}x");
                             if password { assert!(!output.galley.text().contains("123456789")); }
                         });
                     });

@@ -714,8 +714,7 @@ fn parse_raw_response(bytes: &[u8]) -> Result<RawResponse, String> {
 fn decode_chunked(body: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut rest = body;
-    loop {
-        let Some(end) = rest.windows(2).position(|window| window == b"\r\n") else { break };
+    while let Some(end) = rest.windows(2).position(|window| window == b"\r\n") {
         // 块大小后面可能跟 `;扩展`，只取前面那一段
         let size_text = String::from_utf8_lossy(&rest[..end]);
         let size = usize::from_str_radix(size_text.split(';').next().unwrap_or_default().trim(), 16)

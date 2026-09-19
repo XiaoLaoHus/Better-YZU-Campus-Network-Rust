@@ -3,7 +3,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::Duration;
 
 use crate::config::Config;
-use crate::login::{build_client, login_attempt, show_msg};
+use crate::login::{login_attempt, show_msg, Gateway};
 
 fn wait_for_stop(stop: &Receiver<()>, interval: Duration) -> bool {
     !matches!(stop.recv_timeout(interval), Err(RecvTimeoutError::Timeout))
@@ -18,14 +18,16 @@ pub fn run(path: &Path, once: bool, stop: &Receiver<()>) -> Result<(), String> {
 pub fn run_config(config: Config, once: bool, stop: &Receiver<()>) -> Result<(), String> {
     config.validate().map_err(|error| error.to_string())?;
     crate::logging::set_secrets(&config.user_id, &config.password);
-    show_msg("启动了喵...困困困喵");
-    let client = build_client(&config).map_err(|error| format!("无法创建 HTTP 客户端: {error}"))?;
+    // 版本号写进日志：用户贴出来的日志必须能一眼看清是哪个构建，
+    // 否则排查时无法确认「这个现象对应这份代码」。
+    show_msg(&format!("启动了喵...困困困喵（v{}）", env!("CARGO_PKG_VERSION")));
+    let mut gateway = Gateway::new(&config)?;
 
     loop {
         if !matches!(stop.try_recv(), Err(TryRecvError::Empty)) {
             return Ok(());
         }
-        if let Err(error) = login_attempt(&client, &config) {
+        if let Err(error) = login_attempt(&mut gateway, &config) {
             show_msg(&error.to_string());
         }
         if once {

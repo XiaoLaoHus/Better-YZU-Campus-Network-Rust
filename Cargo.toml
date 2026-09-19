@@ -1,6 +1,6 @@
 [package]
 name = "better-yzu-campus-network"
-version = "2.1.1"
+version = "3.0.0"
 edition = "2021"
 description = "扬州大学校园网自动登录和断线重连脚本"
 license = "MIT"
@@ -13,8 +13,11 @@ serde_json = "1"
 toml = "0.8"
 
 [target.'cfg(windows)'.dependencies]
-native-windows-gui = { version = "1.0.13", default-features = false, features = ["menu", "cursor", "textbox", "combobox", "high-dpi", "embed-resource"] }
-winapi = { version = "0.3", features = ["handleapi", "processenv", "shellapi", "winbase", "wincon", "winuser", "wingdi"] }
+eframe = { version = "=0.31.1", default-features = false, features = ["accesskit", "default_fonts", "wgpu"] }
+wgpu = { version = "24", default-features = false, features = ["dx12"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+raw-window-handle = "0.6"
+winapi = { version = "0.3", features = ["commctrl", "handleapi", "libloaderapi", "processenv", "shellapi", "winbase", "wincon", "winuser"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"

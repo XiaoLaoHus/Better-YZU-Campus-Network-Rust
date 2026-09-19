@@ -1,79 +1,86 @@
-//! Small, native GDI skin. Controls remain real Win32 edit/combo/button controls.
-use native_windows_gui as nwg;
-use winapi::shared::{minwindef::LRESULT, windef::{HDC, HWND, RECT}};
-use winapi::um::{wingdi::*, winuser::*};
+use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily, FontId, Margin, RichText, Stroke, TextStyle};
 
-pub const BACKGROUND: [u8; 3] = [245, 246, 250];
-pub const CARD: [u8; 3] = [255, 255, 255];
+pub const BACKGROUND: Color32 = Color32::from_rgb(245, 246, 250);
+pub const CARD: Color32 = Color32::WHITE;
+pub const ACCENT: Color32 = Color32::from_rgb(36, 91, 196);
+pub const MUTED: Color32 = Color32::from_rgb(99, 110, 129);
 
-pub fn owner_draw(button: &nwg::Button) {
-    unsafe {
-        let hwnd = button.handle.hwnd().unwrap();
-        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-        SetWindowLongPtrW(hwnd, GWL_STYLE, (style & !(BS_TYPEMASK as isize)) | BS_OWNERDRAW as isize);
+pub fn setup(ctx: &egui::Context) -> Result<(), String> {
+    let root = std::env::var_os("WINDIR").map(std::path::PathBuf::from)
+        .unwrap_or_else(|| "C:/Windows".into()).join("Fonts");
+    let mut fonts = FontDefinitions::default();
+    let bytes = ["msyh.ttc", "msyh.ttf", "simhei.ttf", "simsun.ttc", "NotoSansSC.ttf"]
+        .iter().find_map(|name| std::fs::read(root.join(name)).ok())
+        .ok_or("未找到可用中文字体（微软雅黑、黑体或宋体），请检查 Windows 字体安装。")?;
+    fonts.font_data.insert("chinese".into(), FontData::from_owned(bytes).into());
+    for family in [FontFamily::Proportional, FontFamily::Monospace] {
+        fonts.families.get_mut(&family).unwrap().insert(0, "chinese".into());
     }
+    ctx.set_fonts(fonts);
+    let mut style = (*ctx.style()).clone();
+    style.visuals = egui::Visuals::light();
+    style.visuals.panel_fill = BACKGROUND;
+    style.visuals.window_fill = CARD;
+    style.visuals.extreme_bg_color = Color32::from_rgb(248, 250, 253);
+    style.visuals.override_text_color = Some(Color32::from_rgb(38, 47, 65));
+    style.visuals.selection.bg_fill = Color32::from_rgb(206, 223, 255);
+    for widget in [&mut style.visuals.widgets.inactive, &mut style.visuals.widgets.hovered, &mut style.visuals.widgets.active] {
+        widget.corner_radius = 8.into();
+    }
+    style.spacing.item_spacing = egui::vec2(12.0, 10.0);
+    style.spacing.button_padding = egui::vec2(16.0, 9.0);
+    style.spacing.interact_size.y = 42.0;
+    style.text_styles.insert(TextStyle::Body, FontId::proportional(15.0));
+    style.text_styles.insert(TextStyle::Button, FontId::proportional(15.0));
+    style.text_styles.insert(TextStyle::Heading, FontId::proportional(26.0));
+    style.text_styles.insert(TextStyle::Small, FontId::proportional(12.0));
+    ctx.set_style(style);
+    Ok(())
 }
 
-unsafe fn rounded(dc: HDC, rect: &RECT, radius: i32, color: u32) {
-    let brush = CreateSolidBrush(color);
-    let previous_brush = SelectObject(dc, brush as _);
-    let previous_pen = SelectObject(dc, GetStockObject(NULL_PEN as i32));
-    RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, radius, radius);
-    SelectObject(dc, previous_pen);
-    SelectObject(dc, previous_brush);
-    DeleteObject(brush as _);
+pub fn card() -> egui::Frame {
+    egui::Frame::new().fill(CARD).corner_radius(14).inner_margin(Margin::same(20))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(230, 234, 242)))
 }
 
-pub fn background(hwnd: HWND, dc: HDC) -> LRESULT {
-    unsafe {
-        let mut rect: RECT = std::mem::zeroed();
-        GetClientRect(hwnd, &mut rect);
-        let brush = CreateSolidBrush(RGB(245, 246, 250));
-        FillRect(dc, &rect, brush);
-        DeleteObject(brush as _);
-        let scale = rect.right as f32 / 760.0;
-        let px = |n: i32| (n as f32 * scale).round() as i32;
-        for (top, bottom) in [(116, 348), (398, 570)] {
-            let card = RECT { left: px(24), top: px(top), right: px(736), bottom: px(bottom) };
-            rounded(dc, &card, px(24), RGB(255, 255, 255));
+pub fn primary(text: &str) -> egui::Button<'_> {
+    egui::Button::new(RichText::new(text).color(Color32::WHITE)).fill(ACCENT)
+}
+
+pub fn input<'a>(text: &'a mut String, id: &str, password: bool) -> egui::TextEdit<'a> {
+    egui::TextEdit::singleline(text).id(egui::Id::new(id)).password(password)
+        .horizontal_align(egui::Align::Center).vertical_align(egui::Align::Center)
+        .margin(Margin::symmetric(12, 8)).min_size(egui::vec2(0.0, 42.0))
+        .desired_width(f32::INFINITY)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_text_is_centered_at_each_scale() {
+        for scale in [1.0, 1.5, 2.0] {
+            for password in [false, true] {
+                let ctx = egui::Context::default();
+                ctx.set_pixels_per_point(scale);
+                let mut text = "123456789".to_owned();
+                // Warm up font/layout state before checking the final geometry.
+                for _ in 0..2 {
+                    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            ui.set_width(320.0);
+                            let output = input(&mut text, "center-test", password).show(ui);
+                            let text_center = output.galley_pos + output.galley.size() / 2.0;
+                            let center = output.response.rect.center();
+                            assert!((text_center.x - center.x).abs() <= 1.0, "horizontal centering at {scale}x");
+                            assert!((text_center.y - center.y).abs() <= 1.0, "vertical centering at {scale}x");
+                            assert!(output.response.rect.height() >= 42.0);
+                            if password { assert!(!output.galley.text().contains("123456789")); }
+                        });
+                    });
+                }
+            }
         }
     }
-    1
-}
-
-pub fn button(lparam: isize, primary: HWND) -> Option<LRESULT> {
-    unsafe {
-        let item = &*(lparam as *const DRAWITEMSTRUCT);
-        if item.CtlType != ODT_BUTTON { return None; }
-        let saved = SaveDC(item.hDC);
-        let disabled = item.itemState & ODS_DISABLED != 0;
-        let pressed = item.itemState & ODS_SELECTED != 0;
-        let accent = item.hwndItem == primary;
-        let bg = if disabled { RGB(227, 230, 237) }
-            else if accent && pressed { RGB(23, 67, 159) }
-            else if accent { RGB(36, 91, 196) }
-            else if pressed { RGB(219, 225, 237) }
-            else { RGB(233, 237, 245) };
-        // Clear the rectangular corners before drawing a rounded button.
-        let brush = CreateSolidBrush(RGB(245, 246, 250));
-        FillRect(item.hDC, &item.rcItem, brush);
-        DeleteObject(brush as _);
-        let height = item.rcItem.bottom - item.rcItem.top;
-        rounded(item.hDC, &item.rcItem, height / 2, bg);
-        SetBkMode(item.hDC, TRANSPARENT as i32);
-        SetTextColor(item.hDC, if disabled { RGB(110, 116, 129) }
-            else if accent { RGB(255, 255, 255) } else { RGB(38, 47, 65) });
-        let font = SendMessageW(item.hwndItem, WM_GETFONT, 0, 0);
-        if font != 0 { SelectObject(item.hDC, font as _); }
-        let mut text = [0u16; 128];
-        let length = GetWindowTextW(item.hwndItem, text.as_mut_ptr(), text.len() as i32);
-        let mut rect = item.rcItem;
-        DrawTextW(item.hDC, text.as_ptr(), length, &mut rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        if item.itemState & ODS_FOCUS != 0 {
-            InflateRect(&mut rect, -5, -5);
-            DrawFocusRect(item.hDC, &rect);
-        }
-        RestoreDC(item.hDC, saved);
-    }
-    Some(1)
 }

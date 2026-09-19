@@ -6,6 +6,8 @@ mod login;
 mod worker;
 #[cfg(windows)]
 mod windows_ui;
+#[cfg(any(windows, test))]
+mod ui_state;
 
 use std::env;
 use std::path::PathBuf;
@@ -84,7 +86,7 @@ fn main() {
                 .unwrap_or_else(|| CONFIG_FILE.into())
         });
         if let Err(error) = windows_ui::run(path, args.minimized) {
-            native_windows_gui::simple_message("校园网客户端启动失败", &error.to_string());
+            windows_ui::startup_error(&error.to_string());
             std::process::exit(1);
         }
         return;

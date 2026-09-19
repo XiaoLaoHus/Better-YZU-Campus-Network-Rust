@@ -78,9 +78,29 @@ jobs:
           "./target/release/${BIN_NAME}" --help
           # GitHub 不在校园网中；这里验证启动，不声称实际登录成功。
 
+      - name: 准备 Windows UI 自动化环境
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装 Windows UI 自动化依赖
+        if: runner.os == 'Windows'
+        run: python -m pip install pywinauto==0.6.9 Pillow==11.1.0
+
       - name: Windows 窗口与命令行冒烟测试
         if: runner.os == 'Windows'
+        env:
+          WGPU_BACKEND: dx12
         run: python .github/scripts/windows-smoke.py target/release/better-yzu-campus-network.exe
+
+      - name: 上传 Windows 界面截图与诊断
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-ui-smoke
+          path: artifacts/windows-ui/
+          if-no-files-found: warn
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4

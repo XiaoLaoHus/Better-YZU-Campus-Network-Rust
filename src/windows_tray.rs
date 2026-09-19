@@ -93,11 +93,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: UINT, w: WPARAM, l: L
             return 0;
         }
         WM_NCDESTROY => { RemoveWindowSubclass(hwnd, Some(window_proc), id); }
-        _ if message == state.taskbar_created => {
-            if !state.register(NIM_ADD) {
-                state.restore();
-                let _ = state.events.send(Event::Unavailable);
-            }
+        _ if message == state.taskbar_created && !state.register(NIM_ADD) => {
+            state.restore();
+            let _ = state.events.send(Event::Unavailable);
         }
         _ => {}
     }

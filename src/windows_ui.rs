@@ -214,12 +214,16 @@ impl App {
                 let label = columns[0].label("网络服务");
                 let selected = self.service_index.checked_sub(1).and_then(|i| crate::login::SERVICE_LIST.get(i))
                     .copied().unwrap_or("请选择网络服务");
-                egui::ComboBox::from_id_salt("service").width(columns[0].available_width()).selected_text(selected)
+                let enabled = columns[0].is_enabled();
+                let selector = egui::ComboBox::from_id_salt("service").width(columns[0].available_width()).selected_text(selected)
                     .show_ui(&mut columns[0], |ui| {
                         for (i, name) in crate::login::SERVICE_LIST.iter().enumerate() {
                             ui.selectable_value(&mut self.service_index, i + 1, *name);
                         }
                     }).response.labelled_by(label.id);
+                // from_id_salt 会让 egui 把 accesskit 名字设成空串，反而盖住 labelled_by 关系，
+                // 读屏和 UI 自动化据此才拿得到「网络服务」这个名字。
+                selector.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, enabled, "网络服务"));
                 columns[1].add_space(20.0);
                 columns[1].label(RichText::new("默认每 10 分钟检查一次\n密码仅以明文保存在本机配置文件").small().color(style::MUTED));
             });

@@ -280,6 +280,32 @@ fn auth_url_from_text(text: &str) -> Option<String> {
 fn discover_entry(gateway: &mut Gateway) -> Result<Discovery, LoginError> {
     let mut responded = false;
     let mut last_error = None;
+    for path in gateway.order() {
+        match discover_entry_on_path(gateway, path) {
+            Ok(Discovery::Entry(entry)) => {
+                gateway.remember(path);
+                return Ok(Discovery::Entry(entry));
+            }
+            Ok(Discovery::NoEntry) => {
+                responded = true;
+                show_msg(&format!(
+                    "  {} 未取得认证入口，尝试其他路径。",
+                    path.label()
+                ));
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if responded {
+        Ok(Discovery::NoEntry)
+    } else {
+        Err(last_error.unwrap_or_else(|| LoginError::Unexpected("无法探测网关".into())))
+    }
+}
+
+fn discover_entry_on_path(gateway: &mut Gateway, path: Path) -> Result<Discovery, LoginError> {
+    let mut responded = false;
+    let mut last_error = None;
 
     for probe in PROBE_URLS {
         let mut current = probe.to_string();
@@ -288,10 +314,10 @@ fn discover_entry(gateway: &mut Gateway) -> Result<Discovery, LoginError> {
             show_msg(&format!(
                 "探测 {} ...（路径：{}）",
                 redact(&current),
-                gateway.path.label()
+                path.label()
             ));
 
-            let fetched = match gateway.get(&current) {
+            let fetched = match gateway.fetch_on_path(&current, true, path) {
                 Ok(fetched) => fetched,
                 Err(error) => {
                     show_msg(&format!("  无法连接：{error}"));
@@ -455,11 +481,6 @@ impl Gateway {
         }
     }
 
-    /// 探测用的 GET。
-    fn get(&mut self, url: &str) -> Result<Fetched, LoginError> {
-        self.fetch(url, true)
-    }
-
     /// 登录流程用的 GET：与 POST 共用同一个 Cookie 罐。
     fn get_login(&mut self, url: &str) -> Result<Fetched, LoginError> {
         self.fetch(url, false)
@@ -468,13 +489,7 @@ impl Gateway {
     fn fetch(&mut self, url: &str, detect: bool) -> Result<Fetched, LoginError> {
         let mut last = None;
         for candidate in self.order() {
-            let outcome = match (candidate, detect) {
-                (Path::Proxy, true) => reqwest_fetch(&self.detect_proxy, url, DETECT_TIMEOUT),
-                (Path::Direct, true) => reqwest_fetch(&self.detect_direct, url, DETECT_TIMEOUT),
-                (Path::Proxy, false) => reqwest_fetch(&self.login_proxy, url, GET_TIMEOUT),
-                (Path::Direct, false) => reqwest_fetch(&self.login_direct, url, GET_TIMEOUT),
-                (Path::Raw, _) => self.raw.get(url),
-            };
+            let outcome = self.fetch_on_path(url, detect, candidate);
             match outcome {
                 Ok(fetched) => {
                     self.remember(candidate);
@@ -489,19 +504,54 @@ impl Gateway {
         Err(last.unwrap_or_else(|| LoginError::Unexpected("三条路径都走不通".to_string())))
     }
 
-    /// POST 表单，同样是三条路按序试。
-    fn post_form(&mut self, url: &str, referer: &str, body: &str) -> Result<Fetched, LoginError> {
+    fn fetch_on_path(
+        &mut self,
+        url: &str,
+        detect: bool,
+        path: Path,
+    ) -> Result<Fetched, LoginError> {
+        match (path, detect) {
+            (Path::Proxy, true) => reqwest_fetch(&self.detect_proxy, url, DETECT_TIMEOUT),
+            (Path::Direct, true) => reqwest_fetch(&self.detect_direct, url, DETECT_TIMEOUT),
+            (Path::Proxy, false) => reqwest_fetch(&self.login_proxy, url, GET_TIMEOUT),
+            (Path::Direct, false) => reqwest_fetch(&self.login_direct, url, GET_TIMEOUT),
+            (Path::Raw, _) => self.raw.get(url),
+        }
+    }
+
+    /// 登录响应必须是有效 JSON，HTML 错误页不能算作一条路径走通。
+    fn post_login_form(
+        &mut self,
+        url: &str,
+        referer: &str,
+        body: &str,
+    ) -> Result<serde_json::Value, LoginError> {
         let mut last = None;
         for candidate in self.order() {
+            // 切换传输路径时，先用该路径取得认证页和 Cookie。
+            // 各客户端的 Cookie 罐独立，不能直接复用另一条路径的 GET。
+            if candidate != self.path {
+                let session = match candidate {
+                    Path::Proxy => reqwest_fetch(&self.login_proxy, referer, GET_TIMEOUT),
+                    Path::Direct => reqwest_fetch(&self.login_direct, referer, GET_TIMEOUT),
+                    Path::Raw => self.raw.get(referer),
+                };
+                if let Err(error) = session {
+                    show_msg(&format!("  {} 认证页请求失败：{error}", candidate.label()));
+                    last = Some(error);
+                    continue;
+                }
+            }
             let outcome = match candidate {
                 Path::Proxy => reqwest_post(&self.login_proxy, url, referer, body),
                 Path::Direct => reqwest_post(&self.login_direct, url, referer, body),
                 Path::Raw => self.raw.post_form(url, referer, body),
-            };
+            }
+            .and_then(|fetched| parse_login_response(&fetched));
             match outcome {
-                Ok(fetched) => {
+                Ok(json) => {
                     self.remember(candidate);
-                    return Ok(fetched);
+                    return Ok(json);
                 }
                 Err(error) => {
                     show_msg(&format!("  {} 不通：{error}", candidate.label()));
@@ -509,8 +559,48 @@ impl Gateway {
                 }
             }
         }
-        Err(last.unwrap_or_else(|| LoginError::Unexpected("三条路径都走不通".to_string())))
+        let reason = last
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "三条路径都走不通".to_string());
+        Err(LoginError::Flow(format!(
+            "登录未完成：{reason}。请确认认证网址属于当前设备且仍有效，并检查系统代理或 VPN 设置。"
+        )))
     }
+}
+
+/// 仅输出状态码、固定响应类别和长度，不输出正文或响应头中的任意值。
+fn parse_login_response(fetched: &Fetched) -> Result<serde_json::Value, LoginError> {
+    let text = String::from_utf8_lossy(&fetched.body);
+    // 部分网关在 JSON 开头附带 UTF-8 BOM。
+    let json = serde_json::from_str::<serde_json::Value>(text.trim_start_matches('\u{feff}'));
+    if let Ok(value) = json {
+        // 网关已明确拒绝账号或密码时，不再次提交相同凭据。
+        if (200..300).contains(&fetched.status)
+            || value.get("result").and_then(|result| result.as_str()) == Some("fail")
+        {
+            return Ok(value);
+        }
+    }
+    let mime = fetched
+        .content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim();
+    let kind = if fetched.body.is_empty() {
+        "空响应"
+    } else if mime.eq_ignore_ascii_case("text/html") || text.trim_start().starts_with('<') {
+        "HTML 页面"
+    } else if mime.eq_ignore_ascii_case("application/json") {
+        "JSON 响应"
+    } else {
+        "非标准响应"
+    };
+    Err(LoginError::Flow(format!(
+        "登录接口未返回可用结果（HTTP {}，{kind}，{} 字节）",
+        fetched.status,
+        fetched.body.len()
+    )))
 }
 
 /// 用 reqwest 取一次，并压成统一形状。
@@ -940,6 +1030,15 @@ fn service_url_from_entry(entry: &str) -> Result<String, LoginError> {
             "请填写认证 URL：复制浏览器地址栏中的完整校园网认证地址。".into(),
         ));
     }
+    if entry
+        .chars()
+        .last()
+        .is_some_and(|ch| matches!(ch, '，' | '。' | '；'))
+    {
+        return Err(LoginError::Flow(
+            "认证 URL 末尾包含中文标点，请只复制网址，不要包含句末逗号或句号。".into(),
+        ));
+    }
     let parse = |value: &str| -> Result<Url, LoginError> {
         let parsed = Url::parse(value).map_err(|_| {
             LoginError::Flow("认证 URL 格式错误，请复制完整的 http:// 或 https:// 地址。".into())
@@ -1057,19 +1156,7 @@ pub fn login_attempt(gateway: &mut Gateway, config: &Config) -> Result<(), Login
         .append_pair("passwordEncrypt", "")
         .finish();
 
-    let fetched = gateway.post_form(&info.login_url, &info.referer, &body)?;
-
-    // 先拿到响应正文再解析网关 JSON；原始响应不写入日志，避免泄露认证信息。
-    let text = String::from_utf8_lossy(&fetched.body);
-
-    let res_json: serde_json::Value = match serde_json::from_str(&text) {
-        Ok(value) => value,
-        Err(_) => {
-            show_msg("登录失败：服务器响应格式错误。可能原因：您正处于断网状态，且网关返回了非标准错误页面。");
-            // 原始响应可能包含认证信息，不写入 GUI 或控制台日志。
-            return Ok(());
-        }
-    };
+    let res_json = gateway.post_login_form(&info.login_url, &info.referer, &body)?;
 
     match res_json.get("result").and_then(|value| value.as_str()) {
         Some("success") => show_msg("校园网成功连接了，Ciallo～(∠・ω< )～"),
@@ -1137,12 +1224,186 @@ impl Error for LoginError {
 mod tests {
     use super::*;
 
+    fn mock_responses(
+        responses: Vec<String>,
+    ) -> (SocketAddr, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::Instant;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut requests = Vec::new();
+            for response in responses {
+                let stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "missing mock request");
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut headers = String::new();
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    headers.push_str(&line);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|length| length.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                requests.push(headers + &String::from_utf8(body).unwrap());
+                reader.get_mut().write_all(response.as_bytes()).unwrap();
+            }
+            requests
+        });
+        (address, server)
+    }
+
+    fn response(body: &str, extra_headers: &str) -> String {
+        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{extra_headers}Connection: close\r\n\r\n{body}", body.len())
+    }
+
+    fn proxy_client(address: SocketAddr) -> Client {
+        Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{address}")).unwrap())
+            .cookie_store(true)
+            .redirect(Policy::none())
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn html_login_response_retries_direct_with_its_own_session_cookie() {
+        let (address, server) = mock_responses(vec![
+            response("portal", "Set-Cookie: JSESSIONID=proxy-session; Path=/\r\n"),
+            response("<html>proxy error</html>", "Content-Type: text/html\r\n"),
+            response(
+                "portal",
+                "Set-Cookie: JSESSIONID=direct-session; Path=/\r\n",
+            ),
+            response(
+                r#"{"result":"success"}"#,
+                "Content-Type: application/json\r\n",
+            ),
+        ]);
+        let mut gateway = Gateway::new(&Config::default()).unwrap();
+        gateway.login_proxy = proxy_client(address);
+        gateway.login_direct = proxy_client(address);
+        let portal = "http://10.245.2.20/eportal/index.jsp?wlanuserip=SESSION";
+        gateway.get_login(portal).unwrap();
+        let json = gateway
+            .post_login_form(
+                "http://10.245.2.20/eportal/InterFace.do?method=login",
+                portal,
+                "userId=test",
+            )
+            .unwrap();
+        assert_eq!(json["result"], "success");
+        assert!(gateway.path == Path::Direct);
+        let requests = server.join().unwrap();
+        assert!(requests[2].starts_with(&format!("GET {portal} HTTP/1.1")));
+        assert!(requests[3]
+            .to_ascii_lowercase()
+            .contains("cookie: jsessionid=direct-session"));
+        assert!(!requests[3].contains("proxy-session"));
+    }
+
+    #[test]
+    fn discovery_retries_direct_when_proxy_only_returns_external_pages() {
+        let portal = "http://10.245.2.20/eportal/index.jsp?wlanuserip=SESSION";
+        let (address, server) = mock_responses(vec![
+            response("external page", ""),
+            response("external page", ""),
+            response("external page", ""),
+            format!("HTTP/1.1 302 Found\r\nLocation: {portal}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+        ]);
+        let mut gateway = Gateway::new(&Config::default()).unwrap();
+        gateway.detect_proxy = proxy_client(address);
+        gateway.detect_direct = proxy_client(address);
+        let Discovery::Entry(entry) = discover_entry(&mut gateway).unwrap() else {
+            panic!("direct path must return the authentication entry");
+        };
+        assert_eq!(entry, portal);
+        assert!(gateway.path == Path::Direct);
+        assert_eq!(server.join().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn explicit_login_rejection_does_not_resubmit_credentials() {
+        let (address, server) = mock_responses(vec![
+            response("portal", ""),
+            response(r#"{"result":"fail","message":"bad credentials"}"#, ""),
+        ]);
+        let mut gateway = Gateway::new(&Config::default()).unwrap();
+        gateway.login_proxy = proxy_client(address);
+        let portal = "http://10.245.2.20/eportal/index.jsp?wlanuserip=SESSION";
+        gateway.get_login(portal).unwrap();
+        let json = gateway
+            .post_login_form(
+                "http://10.245.2.20/eportal/InterFace.do?method=login",
+                portal,
+                "userId=test",
+            )
+            .unwrap();
+        assert_eq!(json["result"], "fail");
+        assert!(gateway.path == Path::Proxy);
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn login_response_diagnostics_do_not_expose_response_content() {
+        let mut fetched = Fetched {
+            status: 403,
+            location: Some("http://example.test/?token=SECRET".into()),
+            content_type: "text/html; token=SECRET".into(),
+            body: b"<html>SECRET</html>".to_vec(),
+        };
+        let error = parse_login_response(&fetched).unwrap_err().to_string();
+        assert!(error.contains("HTTP 403") && error.contains("HTML"));
+        assert!(!error.contains("SECRET"));
+        fetched.status = 200;
+        fetched.body = "\u{feff}{\"result\":\"success\"}".as_bytes().to_vec();
+        assert_eq!(parse_login_response(&fetched).unwrap()["result"], "success");
+        fetched.status = 503;
+        assert!(parse_login_response(&fetched).is_err());
+        fetched.status = 200;
+        fetched.body = br#"{"result":"fail","message":"bad credentials"}"#.to_vec();
+        fetched.status = 403;
+        assert_eq!(parse_login_response(&fetched).unwrap()["result"], "fail");
+    }
+
     #[test]
     fn manual_sso_and_portal_urls_keep_identical_session_parameters() {
         let portal = "http://10.245.2.20/eportal/index.jsp?wlanuserip=SECRET&mac=a%2Bb&t=wireless-v2&url=x%252Fy";
         let mut sso = Url::parse("https://sso.yzu.edu.cn/login").unwrap();
         sso.query_pairs_mut().append_pair("service", portal);
-        for entry in [portal.to_owned(), sso.to_string(), format!("  {portal}  ")] {
+        for entry in [
+            portal.to_owned(),
+            sso.to_string(),
+            sso.to_string().replace("http%3A", "http:"),
+            format!("  {portal}  "),
+        ] {
             let info = redirect_info_from_entry(&entry).unwrap();
             assert_eq!(
                 info.login_url,
@@ -1179,6 +1440,8 @@ mod tests {
             "http://user:SECRET@10.245.2.20/eportal/index.jsp?wlanuserip=test",
             "http://10.245.2.20/eportal/index.jsp?wlanuserip=SECRET#fragment",
             "http://10.245.2.20/eportal/index.jsp?wlanuserip=SECRET mac=x",
+            "http://10.245.2.20/eportal/index.jsp?wlanuserip=SECRET，",
+            "https://sso.yzu.edu.cn/login?service=http%3A%2F%2F10.245.2.20%2Feportal%2Findex.jsp%3Fwlanuserip%3DSECRET，",
         ] {
             let error = validate_auth_url(entry).unwrap_err().to_string();
             assert!(!error.contains("SECRET"));

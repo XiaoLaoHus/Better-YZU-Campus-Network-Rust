@@ -60,7 +60,8 @@ impl LogBuffer {
             if self.0.len() == MAX_LOG_LINES {
                 self.0.pop_front();
             }
-            self.0.push_back(line.chars().take(MAX_MESSAGE_CHARS).collect());
+            self.0
+                .push_back(line.chars().take(MAX_MESSAGE_CHARS).collect());
         }
     }
 

@@ -20,7 +20,7 @@ pub fn run_config(config: Config, once: bool, stop: &Receiver<()>) -> Result<(),
     crate::logging::set_secrets(&config.user_id, &config.password);
     // 版本号写进日志：用户贴出来的日志必须能一眼看清是哪个构建，
     // 否则排查时无法确认「这个现象对应这份代码」。
-    show_msg(&format!("启动了喵...困困困喵（v{}）", env!("CARGO_PKG_VERSION")));
+    show_msg(&format!("启动了喵...困困困喵（v{}）", env!("APP_VERSION")));
     let mut gateway = Gateway::new(&config)?;
 
     loop {
@@ -33,7 +33,10 @@ pub fn run_config(config: Config, once: bool, stop: &Receiver<()>) -> Result<(),
         if once {
             return Ok(());
         }
-        show_msg(&format!("等待 {} 秒后再次尝试，隐藏窗口不影响后台运行。", config.interval_secs));
+        show_msg(&format!(
+            "等待 {} 秒后再次尝试，隐藏窗口不影响后台运行。",
+            config.interval_secs
+        ));
         if wait_for_stop(stop, Duration::from_secs(config.interval_secs)) {
             return Ok(());
         }

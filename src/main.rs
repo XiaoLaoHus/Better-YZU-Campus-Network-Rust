@@ -3,11 +3,11 @@
 mod config;
 mod logging;
 mod login;
-mod worker;
-#[cfg(windows)]
-mod windows_ui;
 #[cfg(any(windows, test))]
 mod ui_state;
+#[cfg(windows)]
+mod windows_ui;
+mod worker;
 
 use std::env;
 use std::path::PathBuf;
@@ -105,7 +105,11 @@ fn attach_console() {
     #[cfg(windows)]
     unsafe {
         // 保留 shell 重定向的管道；只为没有有效标准句柄的双击/终端启动附加控制台。
-        use winapi::um::{processenv::GetStdHandle, winbase::STD_OUTPUT_HANDLE, wincon::{AttachConsole, ATTACH_PARENT_PROCESS}};
+        use winapi::um::{
+            processenv::GetStdHandle,
+            winbase::STD_OUTPUT_HANDLE,
+            wincon::{AttachConsole, ATTACH_PARENT_PROCESS},
+        };
         let stdout = GetStdHandle(STD_OUTPUT_HANDLE);
         if stdout.is_null() || stdout == winapi::um::handleapi::INVALID_HANDLE_VALUE {
             AttachConsole(ATTACH_PARENT_PROCESS);
@@ -128,7 +132,10 @@ mod tests {
         assert!(args.config_path.is_none());
         let args = parse(&["--once", "-c", "含 空格/config.toml"]).unwrap();
         assert!(args.once);
-        assert_eq!(args.config_path.unwrap(), PathBuf::from("含 空格/config.toml"));
+        assert_eq!(
+            args.config_path.unwrap(),
+            PathBuf::from("含 空格/config.toml")
+        );
     }
 
     #[test]

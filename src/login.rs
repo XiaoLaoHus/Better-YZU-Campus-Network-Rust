@@ -6,10 +6,8 @@ use std::time::Duration;
 
 use reqwest::blocking::Client;
 use reqwest::header::{
-    HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, CONTENT_TYPE, LOCATION, REFERER,
-    REFERRER_POLICY,
+    HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, CONTENT_TYPE, REFERER, REFERRER_POLICY,
 };
-use reqwest::redirect::Policy;
 use url::Url;
 
 use crate::config::{Config, SERVICE_COUNT};
@@ -23,58 +21,12 @@ pub const SERVICE_LIST: [&str; SERVICE_COUNT] = [
     "校内免费服务",
 ];
 
-/// 校园网 SSO 域名，用于从网关重定向地址里识别认证入口。
+/// 手动输入的 SSO 登录地址使用的域名。
 const SSO_HOST: &str = "sso.yzu.edu.cn";
-
-/// 校园网门户主机（同时用于校验登录请求的去向）。
-const PORTAL_HOST: &str = "10.245.2.20";
-
-/// 会话参数特征。
-///
-/// 连接校园网时系统会弹出一个认证网页，**页面的地址本身就带着全部会话参数**
-/// （`wlanuserip`、`mac`、`nasip` 等）。这条特征用来把它和 SSO 登录页区分开：
-/// 前者参数就在地址里，后者参数藏在 `service` 参数内。
-const SESSION_MARKER: &str = "wlanuserip";
-
-/// 探测地址，按顺序尝试，命中即止。
-///
-/// 会话参数（`wlanuserip`、`mac` 等）由网关按当次连接生成并做了私有加密，
-/// 无法本地推算，只能在网关的应答里现取；它们绑定具体设备，不适合硬编码进源码。
-///
-/// **只探外网地址**，依据 2026-09-16 的校园网实测：
-/// 未认证时网关会拦截去往外网的请求，把认证页（地址里带着全部会话参数）当正文返回来，
-/// 这正是浏览器弹窗拿到的那份内容。而校园网门户主机 `10.245.2.20` 属于内网、
-/// 不经过拦截，它只会按自己的导航逻辑 302 到 `redirectortosuccess.jsp` 再到自助服务页——
-/// **断网时也照样这么跳**，据此判断「已在线」是误报，所以不再探它。
-///
-/// 地址必须是 HTTP：HTTPS 无法被网关拦截。
-const PROBE_URLS: [&str; 3] = [EXTERNAL_IP_PROBE, EXTERNAL_ALT_IP_PROBE, EXTERNAL_DNS_PROBE];
-
-/// 外网探测：IP 字面量，不需要 DNS。实测劫持后返回 200 加认证页正文。
-const EXTERNAL_IP_PROBE: &str = "http://223.5.5.5/";
-
-/// 外网探测：另一个 IP 字面量（Cloudflare 公共 DNS）。
-///
-/// 跟 `EXTERNAL_IP_PROBE` 同类但目标不同：网关的拦截往往有白名单/黑名单差别，
-/// 一个地址被放行、另一个仍被拦是常见的，多备一个能提高命中率。
-const EXTERNAL_ALT_IP_PROBE: &str = "http://1.1.1.1/";
-
-/// 外网探测：域名，依赖 DNS，实测在未认证时可能解析失败，仅作兜底。
-const EXTERNAL_DNS_PROBE: &str = "http://www.baidu.com/";
-
-/// 无跳转时最多读取多少响应正文用于查找认证入口。
-///
-/// 实测网关可能返回 200 加一个内嵌认证链接的门户兜底页，入口只能从正文里找；
-/// 但正文可能很大（真实外网站点），只读开头即可。
-const MAX_BODY_BYTES: u64 = 32 * 1024;
-
-/// 单次探测最多跟随的重定向次数。
-const MAX_REDIRECT_HOPS: usize = 3;
-
 const GET_TIMEOUT: Duration = Duration::from_secs(5);
 const POST_TIMEOUT: Duration = Duration::from_secs(10);
-/// 探测超时要短于登录请求：它只是连通性检查，且会叠加在退出时的等待时间上。
-const DETECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// 认证响应的读取上限。
+const MAX_BODY_BYTES: u64 = 32 * 1024;
 
 /// 自实现 HTTP 路径用的 User-Agent。
 ///
@@ -84,10 +36,7 @@ const DETECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// 加与不加这些头，reqwest 的结果一模一样。所以它只出现在亲手写的请求里。
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-/// 裸 TCP 检查的超时。只用于给 HTTP 失败定性，不必等太久。
-const TCP_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// 自实现 HTTP 路径的超时。这条路要承担真正的登录请求，给得比探针宽松。
+/// 自实现 HTTP 路径的登录请求超时。
 const RAW_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 自实现 HTTP 路径最多读多少字节，防对端不关连接时把内存读爆。
@@ -132,236 +81,24 @@ fn build_login_client(config: &Config, direct: bool) -> Result<Client, reqwest::
 
 /// 从 SSO 跳转中解析出的登录所需信息
 struct RedirectInfo {
-    /// 网关登录接口，形如 `http://{ip}/eportal/InterFace.do?method=login`
+    /// 网关登录接口。
     login_url: String,
-    /// 网关参数串，原样作为 `queryString` 字段提交
+    /// 原始会话参数，作为 queryString 提交。
     query_string: String,
-    /// 登录请求的 Referer
+    /// 认证页面地址，作为 Referer 提交。
     referer: String,
 }
 
-/// 把地址脱敏成可以安全写进日志的形式：保留协议、主机、路径和参数**名**。
-///
-/// 网关下发的 `Location` 里 `mac`、`wlanuserip` 等是个人数据，值一律不写日志。
-fn redact(url: &str) -> String {
-    let Ok(parsed) = Url::parse(url) else {
-        return "<无法解析的地址>".to_string();
-    };
-    // 显式拼装，不依赖 `Position` 切片的取址细节（`BeforeQuery` 实际含 `?`）。
-    let mut text = format!("{}://{}", parsed.scheme(), parsed.host_str().unwrap_or_default());
-    if let Some(port) = parsed.port() {
-        text.push_str(&format!(":{port}"));
-    }
-    text.push_str(parsed.path());
-
-    let names: Vec<String> = parsed.query_pairs().map(|(key, _)| key.into_owned()).collect();
-    if !names.is_empty() {
-        text.push_str(&format!("?[{}]", names.join(",")));
-    }
-    text
-}
-
-/// 判断主机是否是校园网内网的私有 IPv4 地址。
-///
 /// 登录请求会把密码发往这个主机，因此只接受私有地址，避免被伪造成认证入口的
 /// 外部主机骗走凭据。
 fn is_private_host(host: &str) -> bool {
-    host.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_private())
+    host.parse::<std::net::Ipv4Addr>()
+        .is_ok_and(|ip| ip.is_private())
 }
 
-/// 把 `Location` 头解析成绝对地址。网关可能下发相对路径（如 `/eportal/index.jsp`），
-/// 必须按当前地址补齐，否则下一次请求会拿到非法地址。
-fn resolve_location(base: &str, location: &str) -> Option<String> {
-    Url::parse(base).ok()?.join(location).ok().map(|url| url.to_string())
-}
-
-/// 地址本身是否就是「带会话参数的门户页地址」。
-///
-/// SSO 登录页的 `service` 参数里也会出现同样这些参数名（百分号编码不影响字母），
-/// 所以要一并排除，避免把 SSO 页误判成门户页。
-fn is_session_url(url: &str) -> bool {
-    url.contains(SESSION_MARKER) && !url.contains(SSO_HOST)
-}
-
-/// 识别可用的认证入口，返回原地址。
-///
-/// 实测入口有两种形态，都在这里统一认下：
-/// - **SSO 登录页**：未认证时网关把请求重定向过去，参数藏在 `service` 里；
-/// - **门户页地址**：连接校园网时系统弹出的那个认证网页，参数就在地址本身。
-///
-/// 都不是时返回 `None`。注意门户的 `redirectortosuccess.jsp` 也算「都不是」——
-/// 实测这个网关未认证时同样会跳它，不能据此认定已在线。
-fn entry_from_url(url: &str) -> Option<String> {
-    let parsed = Url::parse(url).ok()?;
-    if parsed.host_str() == Some(SSO_HOST) {
-        return Some(url.to_string());
-    }
-
-    // 认证页也可能挂在别的域名下，此时以 `service` 参数指向门户为准
-    let points_to_portal = parsed
-        .query_pairs()
-        .find(|(key, _)| key == "service")
-        .and_then(|(_, value)| Url::parse(&value).ok())
-        .is_some_and(|target| target.host_str() == Some(PORTAL_HOST));
-    if points_to_portal {
-        return Some(url.to_string());
-    }
-
-    // 门户页地址：只认内网主机，否则一个外网页面上的同名参数就能把密码引出去
-    if is_session_url(url) && parsed.host_str().is_some_and(is_private_host) {
-        return Some(url.to_string());
-    }
-
-    None
-}
-
-/// 探测结果。
-///
-/// 只有「拿到入口」和「没拿到」两种，刻意不再区分「已在线」：实测这个网关
-/// 在**未认证**时也会把门户请求跳到 `redirectortosuccess.jsp`，
-/// 任何基于该页面的「已在线」判断都是误报，会把用户带偏。
-enum Discovery {
-    /// 拿到认证入口
-    Entry(String),
-    /// 网关有响应，但没有认证入口
-    NoEntry,
-}
-
-/// 在文本里切出围绕首个 `marker` 出现的那个地址。
-///
-/// 有些网关不用 302，而是返回 200 加一个内嵌认证链接的门户兜底页，此时入口
-/// 只能从正文里取。正文里的查询参数是 HTML 转义的（`&amp;`），取出后必须还原，
-/// 否则拼进 `queryString` 的参数会错。
-fn url_around(text: &str, marker: &str) -> Option<String> {
-    let start = text.find(marker)?;
-
-    // 向前回溯到 URL 起点：上一个分隔符之后。分隔符只取单字节字符，
-    // 避免在多字节字符中间切片。
-    const DELIMITERS: [char; 8] = ['"', '\'', '(', ')', '<', '>', ' ', '\n'];
-    let begin = text[..start]
-        .rfind(DELIMITERS)
-        .map_or(0, |index| index + 1);
-
-    // 向后找到 URL 结束：下一个分隔符之前
-    let tail = &text[start..];
-    let end = tail.find(DELIMITERS).unwrap_or(tail.len());
-
-    let candidate = &text[begin..start + end];
-    // 协议相对地址（`//host/path`）协议头要补齐
-    if candidate.starts_with("//") {
-        return Some(format!("https:{candidate}").replace("&amp;", "&"));
-    }
-    if !candidate.starts_with("http") {
-        return None;
-    }
-    Some(candidate.replace("&amp;", "&"))
-}
-
-/// 从响应正文里找出首个可用认证入口。
-///
-/// 依次按 SSO 域名、会话参数特征定位，返回第一个能通过 `entry_from_url` 的地址。
-fn auth_url_from_text(text: &str) -> Option<String> {
-    [SSO_HOST, SESSION_MARKER]
-        .into_iter()
-        .find_map(|marker| url_around(text, marker).filter(|url| entry_from_url(url).is_some()))
-}
-
-/// 顺着网关的重定向链取回本次会话的认证入口。
-fn discover_entry(gateway: &mut Gateway) -> Result<Discovery, LoginError> {
-    let mut responded = false;
-    let mut last_error = None;
-
-    for probe in PROBE_URLS {
-        let mut current = probe.to_string();
-
-        for _ in 0..MAX_REDIRECT_HOPS {
-            show_msg(&format!("探测 {} ...（路径：{}）", redact(&current), gateway.path.label()));
-
-            let fetched = match gateway.get(&current) {
-                Ok(fetched) => fetched,
-                Err(error) => {
-                    show_msg(&format!("  无法连接：{error}"));
-                    // 再补一条裸 socket 的读数：三条路都不通时，它是唯一还能说明
-                    // 「链路到底给不给响应」的证据。
-                    show_msg(&format!("  {}", raw_http_probe(&current)));
-                    last_error = Some(error);
-                    break;
-                }
-            };
-            responded = true;
-
-            let status = fetched.status;
-
-            let Some(location) = fetched.location else {
-                // 网关可能不用 302：实测它直接返回 200 加一个门户兜底页，
-                // 认证入口只能在正文里找。
-                let body = String::from_utf8_lossy(&fetched.body);
-                show_msg(&format!(
-                    "  HTTP {status}，无跳转（{}，{} 字节）",
-                    fetched.content_type,
-                    fetched.body.len()
-                ));
-
-                if let Some(url) = auth_url_from_text(&body) {
-                    show_msg(&format!("  正文中找到认证入口 → {}", redact(&url)));
-                    return Ok(Discovery::Entry(url));
-                }
-                // 有链接但用不上：把地址脱敏后打出来，方便对着排查
-                if let Some(url) = url_around(&body, SESSION_MARKER)
-                    .or_else(|| url_around(&body, SSO_HOST))
-                {
-                    show_msg(&format!("  正文中的链接不可用，已忽略 → {}", redact(&url)));
-                }
-                break;
-            };
-
-            // 网关可能下发相对路径，必须按当前地址解析成绝对地址再跟下一步，
-            // 否则下一轮请求会因为拿到非法地址而直接失败、链路断掉。
-            let Some(next) = resolve_location(&current, &location) else {
-                show_msg(&format!("  HTTP {status}，跳转地址无法解析"));
-                break;
-            };
-            show_msg(&format!("  HTTP {status}，跳转 → {}", redact(&next)));
-
-            if entry_from_url(&next).is_some() {
-                show_msg("找到认证入口，正在获取本次会话参数...");
-                return Ok(Discovery::Entry(next));
-            }
-            current = next;
-        }
-    }
-
-    if !responded {
-        let error = last_error.unwrap_or_else(|| LoginError::Unexpected("无法探测网关".to_string()));
-        return Err(error);
-    }
-
-    Ok(Discovery::NoEntry)
-}
-
-/// 探测专用的客户端：必须关闭重定向跟随，否则读不到网关下发的 `Location`。
-///
-/// 除本函数那个 `direct` 开关外，与 v2.0.0 的原样一致。
-fn build_detect_client(direct: bool) -> Result<Client, LoginError> {
-    let mut builder = Client::builder().redirect(Policy::none());
-    if direct {
-        builder = builder.no_proxy();
-    }
-    builder
-        .build()
-        .map_err(|error| LoginError::Unexpected(format!("无法创建探测客户端: {error}")))
-}
-
-/// 一次请求的结果。
-///
-/// 把 reqwest 与自实现两条路的产出压成同一种形状，后面读 `Location`、
-/// 去正文里找认证入口的代码就不用分情况了。
+/// reqwest 与自实现 HTTP 的认证响应正文。
 struct Fetched {
     status: u16,
-    /// 网关下发的跳转目标；为 `None` 时认证入口要去正文里找
-    location: Option<String>,
-    /// 响应类型，只用于打日志
-    content_type: String,
     body: Vec<u8>,
 }
 
@@ -400,9 +137,6 @@ pub struct Gateway {
     /// 登录请求（GET 认证页、POST 登录）：要 Cookie 罐、跟随重定向
     login_proxy: Client,
     login_direct: Client,
-    /// 探测请求：不跟随重定向，否则读不到网关下发的 `Location`
-    detect_proxy: Client,
-    detect_direct: Client,
     /// 绕开 reqwest 的那条路，自带 Cookie 罐
     raw: RawClient,
     /// 当前认为走得通的路
@@ -416,8 +150,6 @@ impl Gateway {
                 .map_err(|error| format!("无法创建 HTTP 客户端（系统代理）: {error}"))?,
             login_direct: build_login_client(config, true)
                 .map_err(|error| format!("无法创建 HTTP 客户端（直连）: {error}"))?,
-            detect_proxy: build_detect_client(false).map_err(|error| error.to_string())?,
-            detect_direct: build_detect_client(true).map_err(|error| error.to_string())?,
             raw: RawClient::new(),
             path: Path::Proxy,
         })
@@ -440,25 +172,14 @@ impl Gateway {
         }
     }
 
-    /// 探测用的 GET。
-    fn get(&mut self, url: &str) -> Result<Fetched, LoginError> {
-        self.fetch(url, true)
-    }
-
     /// 登录流程用的 GET：与 POST 共用同一个 Cookie 罐。
     fn get_login(&mut self, url: &str) -> Result<Fetched, LoginError> {
-        self.fetch(url, false)
-    }
-
-    fn fetch(&mut self, url: &str, detect: bool) -> Result<Fetched, LoginError> {
         let mut last = None;
         for candidate in self.order() {
-            let outcome = match (candidate, detect) {
-                (Path::Proxy, true) => reqwest_fetch(&self.detect_proxy, url, DETECT_TIMEOUT),
-                (Path::Direct, true) => reqwest_fetch(&self.detect_direct, url, DETECT_TIMEOUT),
-                (Path::Proxy, false) => reqwest_fetch(&self.login_proxy, url, GET_TIMEOUT),
-                (Path::Direct, false) => reqwest_fetch(&self.login_direct, url, GET_TIMEOUT),
-                (Path::Raw, _) => self.raw.get(url),
+            let outcome = match candidate {
+                Path::Proxy => reqwest_fetch(&self.login_proxy, url, GET_TIMEOUT),
+                Path::Direct => reqwest_fetch(&self.login_direct, url, GET_TIMEOUT),
+                Path::Raw => self.raw.get(url),
             };
             match outcome {
                 Ok(fetched) => {
@@ -509,7 +230,12 @@ fn reqwest_fetch(client: &Client, url: &str, timeout: Duration) -> Result<Fetche
 }
 
 /// 用 reqwest 发一次表单 POST。
-fn reqwest_post(client: &Client, url: &str, referer: &str, body: &str) -> Result<Fetched, LoginError> {
+fn reqwest_post(
+    client: &Client,
+    url: &str,
+    referer: &str,
+    body: &str,
+) -> Result<Fetched, LoginError> {
     let referer = HeaderValue::from_str(referer)
         .map_err(|error| LoginError::Unexpected(format!("非法的 Referer 头: {error}")))?;
     let response = client
@@ -525,27 +251,18 @@ fn reqwest_post(client: &Client, url: &str, referer: &str, body: &str) -> Result
 /// 把 reqwest 的响应压成统一形状。
 fn fetched_from_reqwest(response: reqwest::blocking::Response) -> Fetched {
     let status = response.status().as_u16();
-    let location = response
-        .headers()
-        .get(LOCATION)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let content_type = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string)
-        .unwrap_or_else(|| "未知类型".to_string());
-
     let mut body = Vec::new();
     // 读超时或读失败也保留已经读到的部分，不影响后续判断
     let _ = response.take(MAX_BODY_BYTES).read_to_end(&mut body);
-    Fetched { status, location, content_type, body }
+    Fetched { status, body }
 }
 
 /// 从地址里拆出主机、端口、请求目标，并解析出要连的地址。
 fn split_target(url: &str) -> Result<(String, String, SocketAddr), String> {
     let parsed = Url::parse(url).map_err(|error| format!("地址无法解析（{error}）"))?;
+    if parsed.scheme() != "http" {
+        return Err("自实现 HTTP 路径仅支持 HTTP；HTTPS 认证请使用 reqwest 路径。".into());
+    }
     let host = parsed.host_str().ok_or("地址里没有主机名")?.to_string();
     let port = parsed.port_or_known_default().unwrap_or(80);
 
@@ -561,8 +278,14 @@ fn split_target(url: &str) -> Result<(String, String, SocketAddr), String> {
     let mut addrs = (host.as_str(), port)
         .to_socket_addrs()
         .map_err(|error| format!("{host}:{port} 解析不出地址（{error}）"))?;
-    let addr = addrs.next().ok_or_else(|| format!("{host}:{port} 没有可用地址"))?;
-    Ok((host, target, addr))
+    let addr = addrs
+        .next()
+        .ok_or_else(|| format!("{host}:{port} 没有可用地址"))?;
+    let authority = match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    };
+    Ok((authority, target, addr))
 }
 
 /// 裸连一次、把请求发出去、读到结束，返回原始字节。
@@ -600,56 +323,6 @@ fn raw_exchange(addr: &SocketAddr, request: &str, timeout: Duration) -> Result<V
     Ok(buffer)
 }
 
-/// 亲手写一个 HTTP 请求发出去，完全绕开 reqwest 与 hyper，回报状态行与响应头名。
-///
-/// 这是三条路里最后一条，也是唯一一条**每次现场实测都拿得到网关响应**的路：
-/// 2026-09-17 与 09-19 两次日志里，同一个进程同一时刻，它从三个探测地址都拿到了
-/// `HTTP/1.1 200 ok`，而 reqwest 一律 `connection closed`。
-///
-/// 留在日志里的作用是给故障定性：reqwest 报 `connection closed` 时，它若能拿到
-/// `HTTP/1.1 200 ok`，就说明链路和网关都正常，毛病在 reqwest 那一侧。
-///
-/// 先按 HTTP/1.1 发，被关了就再试一次 HTTP/1.0 一并报出来——有些老中间设备只认其中一种。
-/// 只回报状态行和响应头**名**：正文和响应头里的值可能是带个人参数的认证页内容，不进日志。
-fn raw_http_probe(url: &str) -> String {
-    let (host, target, addr) = match split_target(url) {
-        Ok(parts) => parts,
-        Err(error) => return format!("手写 HTTP：{error}"),
-    };
-
-    let http11 = format!(
-        "GET {target} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {USER_AGENT}\r\nAccept: */*\r\nConnection: close\r\n\r\n"
-    );
-    let first = summarize_raw(raw_exchange(&addr, &http11, TCP_PROBE_TIMEOUT));
-    if first.starts_with("收到") {
-        return format!("手写 HTTP/1.1：{first}");
-    }
-
-    let http10 = format!("GET {target} HTTP/1.0\r\nUser-Agent: {USER_AGENT}\r\nAccept: */*\r\n\r\n");
-    let second = summarize_raw(raw_exchange(&addr, &http10, TCP_PROBE_TIMEOUT));
-    format!("手写 HTTP/1.1：{first}；HTTP/1.0：{second}")
-}
-
-/// 把裸请求的结果压成一句给日志看的摘要。
-fn summarize_raw(outcome: Result<Vec<u8>, String>) -> String {
-    let buffer = match outcome {
-        Ok(buffer) => buffer,
-        Err(error) => return error,
-    };
-    if buffer.is_empty() {
-        return "对端一个字都没回就关了连接".to_string();
-    }
-    let text = String::from_utf8_lossy(&buffer);
-    let mut lines = text.lines();
-    let status = lines.next().unwrap_or_default().trim_end().to_string();
-    let names: Vec<&str> = lines
-        .take_while(|line| !line.trim().is_empty())
-        .filter_map(|line| line.split(':').next())
-        .map(str::trim)
-        .collect();
-    format!("收到 {} 字节，状态行「{status}」，响应头 [{}]", buffer.len(), names.join(","))
-}
-
 /// 裸请求拿回来的响应。
 struct RawResponse {
     status: u16,
@@ -659,6 +332,7 @@ struct RawResponse {
 }
 
 impl RawResponse {
+    #[cfg(test)]
     fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
@@ -693,9 +367,9 @@ fn parse_raw_response(bytes: &[u8]) -> Result<RawResponse, String> {
         }
     }
 
-    let chunked = headers
-        .iter()
-        .any(|(name, value)| name == "transfer-encoding" && value.to_ascii_lowercase().contains("chunked"));
+    let chunked = headers.iter().any(|(name, value)| {
+        name == "transfer-encoding" && value.to_ascii_lowercase().contains("chunked")
+    });
     let length = headers
         .iter()
         .find(|(name, _)| name == "content-length")
@@ -707,7 +381,11 @@ fn parse_raw_response(bytes: &[u8]) -> Result<RawResponse, String> {
     } else if let Some(length) = length {
         body.truncate(length.min(body.len()));
     }
-    Ok(RawResponse { status, headers, body })
+    Ok(RawResponse {
+        status,
+        headers,
+        body,
+    })
 }
 
 /// 解开分块编码。网关若用 chunked 回登录结果，不解就会把块头当成 JSON 的一部分。
@@ -717,8 +395,9 @@ fn decode_chunked(body: &[u8]) -> Vec<u8> {
     while let Some(end) = rest.windows(2).position(|window| window == b"\r\n") {
         // 块大小后面可能跟 `;扩展`，只取前面那一段
         let size_text = String::from_utf8_lossy(&rest[..end]);
-        let size = usize::from_str_radix(size_text.split(';').next().unwrap_or_default().trim(), 16)
-            .unwrap_or(0);
+        let size =
+            usize::from_str_radix(size_text.split(';').next().unwrap_or_default().trim(), 16)
+                .unwrap_or(0);
         if size == 0 {
             break;
         }
@@ -747,7 +426,9 @@ struct RawClient {
 
 impl RawClient {
     fn new() -> Self {
-        Self { cookies: Vec::new() }
+        Self {
+            cookies: Vec::new(),
+        }
     }
 
     fn get(&mut self, url: &str) -> Result<Fetched, LoginError> {
@@ -756,10 +437,14 @@ impl RawClient {
 
     fn post_form(&mut self, url: &str, referer: &str, body: &str) -> Result<Fetched, LoginError> {
         let headers = [
-            ("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"),
+            (
+                "Content-Type",
+                "application/x-www-form-urlencoded; charset=UTF-8",
+            ),
             ("Referer", referer),
         ];
-        self.send("POST", url, &headers, Some(body)).map(Fetched::from)
+        self.send("POST", url, &headers, Some(body))
+            .map(Fetched::from)
     }
 
     /// 发一次请求。
@@ -782,6 +467,9 @@ impl RawClient {
         }
         if !self.cookies.is_empty() {
             request.push_str(&format!("Cookie: {}\r\n", self.cookies.join("; ")));
+        }
+        if let Some(body) = body {
+            request.push_str(&format!("Content-Length: {}\r\n", body.len()));
         }
         // 一次一连接：不碰连接复用，也就没有「复用了已关闭的连接」这种故障
         request.push_str("Connection: close\r\n\r\n");
@@ -806,7 +494,8 @@ impl RawClient {
                 continue;
             }
             let key = pair.split('=').next().unwrap_or_default();
-            self.cookies.retain(|existing| !existing.starts_with(&format!("{key}=")));
+            self.cookies
+                .retain(|existing| !existing.starts_with(&format!("{key}=")));
             self.cookies.push(pair.to_string());
         }
     }
@@ -814,12 +503,10 @@ impl RawClient {
 
 impl From<RawResponse> for Fetched {
     fn from(response: RawResponse) -> Self {
-        let location = response.header("location").map(str::to_string);
-        let content_type = response
-            .header("content-type")
-            .map(str::to_string)
-            .unwrap_or_else(|| "未知类型".to_string());
-        Self { status: response.status, location, content_type, body: response.body }
+        Self {
+            status: response.status,
+            body: response.body,
+        }
     }
 }
 
@@ -832,14 +519,30 @@ fn describe(error: &reqwest::Error) -> String {
     let mut text = error.to_string();
 
     let mut kinds = Vec::new();
-    if error.is_timeout() { kinds.push("超时"); }
-    if error.is_connect() { kinds.push("连接"); }
-    if error.is_request() { kinds.push("请求"); }
-    if error.is_body() { kinds.push("正文"); }
-    if error.is_decode() { kinds.push("解码"); }
-    if error.is_redirect() { kinds.push("跳转"); }
-    if error.is_status() { kinds.push("状态码"); }
-    if error.is_builder() { kinds.push("构建"); }
+    if error.is_timeout() {
+        kinds.push("超时");
+    }
+    if error.is_connect() {
+        kinds.push("连接");
+    }
+    if error.is_request() {
+        kinds.push("请求");
+    }
+    if error.is_body() {
+        kinds.push("正文");
+    }
+    if error.is_decode() {
+        kinds.push("解码");
+    }
+    if error.is_redirect() {
+        kinds.push("跳转");
+    }
+    if error.is_status() {
+        kinds.push("状态码");
+    }
+    if error.is_builder() {
+        kinds.push("构建");
+    }
     if !kinds.is_empty() {
         text.push_str(&format!(" [{}]", kinds.join("+")));
     }
@@ -852,78 +555,88 @@ fn describe(error: &reqwest::Error) -> String {
     text
 }
 
-/// 从认证入口里取出「带会话参数的门户地址」。
-///
-/// 入口有两种形态，统一成后者再交给 `get_redirect_info`：
-/// - SSO 登录页：会话参数在 `service` 参数里；
-/// - 门户页地址：连接校园网时浏览器被弹到的那个页面，参数就在地址本身。
-fn service_url_from_entry(entry: &str) -> Result<String, LoginError> {
-    // 入口本身就是弹窗页地址：参数已经在地址里，直接用
-    if is_session_url(entry) {
-        return Ok(entry.to_string());
-    }
-
-    // `query_pairs` 会自动做百分号解码，等价于 Python 的 `urllib.parse.parse_qs`
-    let parsed =
-        Url::parse(entry).map_err(|e| LoginError::Flow(format!("无法解析认证入口 URL: {e}")))?;
-
-    parsed
-        .query_pairs()
-        .find(|(key, _)| key == "service")
-        .map(|(_, value)| value.into_owned())
-        .ok_or_else(|| {
-            LoginError::Flow(
-                "意外错误，请联系原作者github:https://github.com/GUMOUXUAN".to_string(),
-            )
-        })
+/// 校验手动输入的地址；不会发出网络请求或回显个人参数。
+pub fn validate_auth_url(entry: &str) -> Result<(), LoginError> {
+    service_url_from_entry(entry).map(|_| ())
 }
 
-/// 解析认证服务器信息。对应原脚本的 `get_redirect_info`。
-fn get_redirect_info(gateway: &mut Gateway, new_url: &str) -> Result<RedirectInfo, LoginError> {
-    show_msg("正在解析认证服务器信息...");
-    show_msg("正在获取参数desuwa...");
-
-    let parsed_new_url =
-        Url::parse(new_url).map_err(|e| LoginError::Flow(format!("无法解析跳转 URL: {e}")))?;
-
-    let ip = parsed_new_url.host_str().unwrap_or_default();
-
-    // 等价于原脚本的 `re.search(r"\?(.*)", new_url)`，此处无需引入 regex 依赖
-    let query_string = new_url.split_once('?').map(|(_, query)| query);
-
-    let (ip, query_string) = match (ip.is_empty(), query_string) {
-        (false, Some(query)) => (ip, query),
-        _ => {
-            // 地址里含个人参数，写日志前先脱敏。
-            return Err(LoginError::Flow(format!(
-                "无法从解析出的 URL 中提取 IP 或 QueryString。当前URL: {}",
-                redact(new_url)
-            )));
-        }
-    };
-
-    // 下面会把密码 POST 到这个主机，只允许校园网私有地址，
-    // 否则一个伪造的跳转就能把凭据引到外部服务器。
-    if !is_private_host(ip) {
-        return Err(LoginError::Flow(format!(
-            "认证服务器地址 {ip} 不是校园网内网地址，已中止以避免泄露账号密码。"
-        )));
+/// SSO 地址先解码 service；门户地址直接使用原始会话参数。
+fn service_url_from_entry(entry: &str) -> Result<String, LoginError> {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return Err(LoginError::Flow(
+            "请填写认证 URL：复制浏览器地址栏中的完整校园网认证地址。".into(),
+        ));
     }
+    let parse = |value: &str| -> Result<Url, LoginError> {
+        let parsed = Url::parse(value).map_err(|_| {
+            LoginError::Flow("认证 URL 格式错误，请复制完整的 http:// 或 https:// 地址。".into())
+        })?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.fragment().is_some()
+            || value.chars().any(char::is_whitespace)
+        {
+            return Err(LoginError::Flow(
+                "认证 URL 必须是完整的 HTTP / HTTPS 地址，不能包含空白、用户名或片段。".into(),
+            ));
+        }
+        Ok(parsed)
+    };
+    let parsed = parse(entry)?;
+    let portal = if parsed.host_str() == Some(SSO_HOST) && parsed.path() == "/login" {
+        parsed
+            .query_pairs()
+            .find(|(key, _)| key == "service")
+            .map(|(_, value)| value.into_owned())
+            .ok_or_else(|| {
+                LoginError::Flow("SSO 认证 URL 缺少 service 参数，请重新复制完整地址。".into())
+            })?
+    } else {
+        entry.to_owned()
+    };
+    let parsed_portal = parse(&portal)?;
+    if !parsed_portal.host_str().is_some_and(is_private_host) {
+        return Err(LoginError::Flow(
+            "认证 URL 中的网关必须是校园网内网 IP 地址。".into(),
+        ));
+    }
+    if parsed_portal.path() != "/eportal/index.jsp"
+        || !parsed_portal
+            .query_pairs()
+            .any(|(key, value)| key == "wlanuserip" && !value.is_empty())
+    {
+        return Err(LoginError::Flow(
+            "认证 URL 缺少有效的门户路径或 wlanuserip 会话参数，请重新复制完整认证地址。".into(),
+        ));
+    }
+    Ok(portal)
+}
 
-    let login_url = format!("http://{ip}/eportal/InterFace.do?method=login");
+/// 从用户指定的地址解析请求目标，保留原始 queryString、协议和端口。
+fn redirect_info_from_entry(entry: &str) -> Result<RedirectInfo, LoginError> {
+    let portal = service_url_from_entry(entry)?;
+    let mut target =
+        Url::parse(&portal).map_err(|_| LoginError::Flow("无法解析认证 URL。".into()))?;
+    let query_string = target.query().unwrap_or_default().to_owned();
+    target.set_path("/eportal/InterFace.do");
+    target.set_query(Some("method=login"));
+    Ok(RedirectInfo {
+        login_url: target.to_string(),
+        query_string,
+        referer: portal,
+    })
+}
 
-    // 与原脚本一致：先 GET 一次认证页，让网关下发会话 Cookie。
-    // 失败不中止：Cookie 不一定真的必需，后面那条 POST 才是决定性的，
-    // 没必要因为一次 GET 拿不到就把整次登录放弃掉。
-    if let Err(error) = gateway.get_login(new_url) {
+/// 先 GET 指定认证页取得 Cookie，再 POST 登录。
+fn get_redirect_info(gateway: &mut Gateway, entry: &str) -> Result<RedirectInfo, LoginError> {
+    let info = redirect_info_from_entry(entry)?;
+    show_msg("正在使用手动填写的认证 URL 解析服务器信息...");
+    if let Err(error) = gateway.get_login(&info.referer) {
         show_msg(&format!("  认证页没取到（{error}），仍继续尝试登录"));
     }
-
-    Ok(RedirectInfo {
-        login_url,
-        query_string: query_string.to_string(),
-        referer: new_url.to_string(),
-    })
+    Ok(info)
 }
 
 /// 尝试登录一次。对应原脚本的 `login_attempt`。
@@ -936,20 +649,7 @@ pub fn login_attempt(gateway: &mut Gateway, config: &Config) -> Result<(), Login
         return Ok(());
     }
 
-    // 会话参数每次现取，源码里不再保留任何个人设备信息。
-    let entry = match discover_entry(gateway)? {
-        Discovery::Entry(entry) => entry,
-        Discovery::NoEntry => {
-            // 不武断地说「已在线」：这个网关断网时也会跳成功页，那种判断是误报。
-            show_msg("未能从网关取到认证入口，跳过本次登录。可能本机已在线；若确实断网，请保留上面的探测日志以便排查。");
-            return Ok(());
-        }
-    };
-
-    // 弹窗页地址直接就是参数串；SSO 入口则还要把 `service` 参数解出来。
-    // 统一成「带会话参数的门户地址」再交给下面解析。
-    let service_url = service_url_from_entry(&entry)?;
-    let info = get_redirect_info(gateway, &service_url)?;
+    let info = get_redirect_info(gateway, &config.auth_url)?;
 
     show_msg("正在尝试登录...");
 
@@ -969,6 +669,12 @@ pub fn login_attempt(gateway: &mut Gateway, config: &Config) -> Result<(), Login
         .finish();
 
     let fetched = gateway.post_form(&info.login_url, &info.referer, &body)?;
+    if !(200..300).contains(&fetched.status) {
+        show_msg(&format!(
+            "登录接口返回 HTTP {}，请检查认证 URL 是否仍有效。",
+            fetched.status
+        ));
+    }
 
     // 先拿到响应正文再解析网关 JSON；原始响应不写入日志，避免泄露认证信息。
     let text = String::from_utf8_lossy(&fetched.body);
@@ -1010,6 +716,8 @@ pub enum LoginError {
 impl LoginError {
     /// 把 `reqwest::Error` 归类到 Network 或 Unexpected。
     fn from_reqwest(error: reqwest::Error) -> Self {
+        // 请求地址带有个人会话参数，不放入日志或错误链。
+        let error = error.without_url();
         if error.is_timeout() || error.is_connect() {
             LoginError::Network(error)
         } else {
@@ -1023,7 +731,11 @@ impl fmt::Display for LoginError {
         match self {
             LoginError::Flow(message) => write!(f, "{message}"),
             LoginError::Network(error) => {
-                write!(f, "网络连接错误：可能未联网或服务器无响应。({})", describe(error))
+                write!(
+                    f,
+                    "网络连接错误：可能未联网或服务器无响应。({})",
+                    describe(error)
+                )
             }
             LoginError::Unexpected(message) => write!(f, "{message}"),
         }
@@ -1044,117 +756,174 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detects_sso_entry_from_redirect_location() {
-        let sso =
-            "https://sso.yzu.edu.cn/login?service=http%3A%2F%2F10.245.2.20%2Feportal%2Findex.jsp";
-        assert_eq!(entry_from_url(sso).as_deref(), Some(sso));
-        assert!(entry_from_url("https://sso.yzu.edu.cn/login").is_some());
-        // 认证页也可能挂在别的域名下，此时以 service 参数指向门户为准
-        let other_host = "http://gw.example/auth?service=http%3A%2F%2F10.245.2.20%2Feportal";
-        assert!(entry_from_url(other_host).is_some());
+    fn manual_sso_and_portal_urls_keep_identical_session_parameters() {
+        let portal = "http://10.245.2.20/eportal/index.jsp?wlanuserip=SECRET&mac=a%2Bb&t=wireless-v2&url=x%252Fy";
+        let mut sso = Url::parse("https://sso.yzu.edu.cn/login").unwrap();
+        sso.query_pairs_mut().append_pair("service", portal);
+        for entry in [portal.to_owned(), sso.to_string(), format!("  {portal}  ")] {
+            let info = redirect_info_from_entry(&entry).unwrap();
+            assert_eq!(
+                info.login_url,
+                "http://10.245.2.20/eportal/InterFace.do?method=login"
+            );
+            assert_eq!(
+                info.query_string,
+                "wlanuserip=SECRET&mac=a%2Bb&t=wireless-v2&url=x%252Fy"
+            );
+            assert_eq!(info.referer, portal);
+        }
     }
 
     #[test]
-    fn detects_portal_page_url_as_entry() {
-        // 连接校园网时弹出的认证页：会话参数就在地址本身，不需要再解 service
-        let popup = "http://10.245.2.20/eportal/index.jsp?wlanuserip=SECRET&wlanacname=x&ssid=&nasip=y&mac=SECRETMAC&t=wireless-v2&url=z";
-        assert_eq!(entry_from_url(popup).as_deref(), Some(popup));
-        assert_eq!(service_url_from_entry(popup).unwrap(), popup);
-        // SSO 页的 service 参数里也含同样的参数名，不能被误判成门户页
-        let sso = "https://sso.yzu.edu.cn/login?service=http%3A%2F%2F10.245.2.20%2Feportal%2Findex.jsp%3Fwlanuserip%3DSECRET";
-        assert!(!is_session_url(sso));
+    fn manual_url_preserves_scheme_and_port() {
+        let info =
+            redirect_info_from_entry("https://10.245.2.20:8443/eportal/index.jsp?wlanuserip=test")
+                .unwrap();
         assert_eq!(
-            service_url_from_entry(sso).unwrap(),
-            "http://10.245.2.20/eportal/index.jsp?wlanuserip=SECRET"
+            info.login_url,
+            "https://10.245.2.20:8443/eportal/InterFace.do?method=login"
         );
-        // 外网页面上的同名参数不认：否则密码会被引到外部主机
-        assert!(entry_from_url("http://evil.example/x?wlanuserip=1").is_none());
     }
 
     #[test]
-    fn ignores_redirects_that_are_not_the_auth_entry() {
-        // 门户成功页不是认证入口。断网时网关同样会跳这里，不能据此认为已在线
-        let success_page = "http://10.245.2.20/eportal/redirectortosuccess.jsp";
-        assert!(entry_from_url(success_page).is_none());
-        assert!(entry_from_url("").is_none());
-        assert!(entry_from_url("不是合法的 URL").is_none());
-        // 外网地址即便带 service 参数也不算认证入口：否则一个伪造的跳转
-        // 就能把密码引到外部主机
-        let hostile = "http://evil.example/login?service=http%3A%2F%2Fevil.example%2F";
-        assert!(entry_from_url(hostile).is_none());
+    fn rejects_incomplete_or_unsafe_manual_urls_without_echoing_parameters() {
+        for entry in [
+            "", "not a URL", "https://sso.yzu.edu.cn/login",
+            "http://10.245.2.20/eportal/index.jsp", "http://10.245.2.20/eportal/index.jsp?wlanuserip=",
+            "http://10.245.2.20/eportal/redirectortosuccess.jsp?wlanuserip=SECRET",
+            "http://evil.example/eportal/index.jsp?wlanuserip=SECRET",
+            "https://sso.yzu.edu.cn/login?service=http%3A%2F%2Fevil.example%2Feportal%2Findex.jsp%3Fwlanuserip%3DSECRET",
+            "ftp://10.245.2.20/eportal/index.jsp?wlanuserip=SECRET",
+            "http://user:SECRET@10.245.2.20/eportal/index.jsp?wlanuserip=test",
+            "http://10.245.2.20/eportal/index.jsp?wlanuserip=SECRET#fragment",
+            "http://10.245.2.20/eportal/index.jsp?wlanuserip=SECRET mac=x",
+        ] {
+            let error = validate_auth_url(entry).unwrap_err().to_string();
+            assert!(!error.contains("SECRET"));
+        }
     }
 
     #[test]
-    fn finds_portal_page_url_in_response_body() {
-        // 有些网关不做跳转，直接把认证页正文返回来，地址在正文里
-        let body = r#"<html><script>window.location.href="http://10.245.2.20/eportal/index.jsp?wlanuserip=SECRET&mac=SECRETMAC";</script></html>"#;
-        let url = auth_url_from_text(body).expect("应从正文中取到入口");
-        assert!(url.starts_with("http://10.245.2.20/eportal/index.jsp?"));
-        assert!(service_url_from_entry(&url).is_ok());
+    fn manual_login_requests_only_configured_portal_and_reuses_cookies() {
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::Instant;
+
+        // A local proxy records every request without contacting the campus gateway.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut requests = Vec::new();
+            for index in 0..4 {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "missing portal request");
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0; 4096];
+                    let count = stream.read(&mut chunk).unwrap();
+                    assert!(count > 0, "incomplete request");
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .map(|length| length.trim().parse::<usize>().unwrap())
+                            .unwrap_or(0);
+                        if bytes.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                requests.push(String::from_utf8(bytes).unwrap());
+                let body = if index % 2 == 0 {
+                    "portal"
+                } else {
+                    r#"{"result":"success"}"#
+                };
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nSet-Cookie: JSESSIONID=test-session; Path=/\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        let portal =
+            "http://10.245.2.20/eportal/index.jsp?wlanuserip=SESSION&mac=a%2Bb&t=wireless-v2";
+        let mut sso = Url::parse("https://sso.yzu.edu.cn/login").unwrap();
+        sso.query_pairs_mut().append_pair("service", portal);
+        let mut config: Config =
+            toml::from_str("user_id = 'test-user'\npassword = 'test-password'\nservice_index = 2")
+                .unwrap();
+        let mut gateway = Gateway::new(&config).unwrap();
+        gateway.login_proxy = Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{proxy_address}")).unwrap())
+            .cookie_store(true)
+            .build()
+            .unwrap();
+        for entry in [portal.to_owned(), sso.to_string()] {
+            config.auth_url = entry;
+            config.validate().unwrap();
+            login_attempt(&mut gateway, &config).unwrap();
+        }
+        let requests = server.join().unwrap();
+        for pair in requests.as_chunks::<2>().0 {
+            assert!(pair[0].starts_with(&format!("GET {portal} HTTP/1.1\r\n")));
+            assert!(pair[1].starts_with(
+                "POST http://10.245.2.20/eportal/InterFace.do?method=login HTTP/1.1\r\n"
+            ));
+            let (headers, body) = pair[1].split_once("\r\n\r\n").unwrap();
+            assert!(headers
+                .to_ascii_lowercase()
+                .contains("cookie: jsessionid=test-session"));
+            assert!(headers.contains(portal));
+            let form: std::collections::HashMap<_, _> =
+                url::form_urlencoded::parse(body.as_bytes())
+                    .into_owned()
+                    .collect();
+            assert_eq!(
+                form["queryString"],
+                "wlanuserip=SESSION&mac=a%2Bb&t=wireless-v2"
+            );
+            assert_eq!(form["userId"], "test-user");
+            assert_eq!(form["password"], "test-password");
+            assert_eq!(form["service"], SERVICE_LIST[1]);
+        }
     }
 
     #[test]
-    fn resolves_relative_redirect_targets() {
-        // 网关下发相对路径时，必须按当前地址补齐，否则重定向链会断掉
-        assert_eq!(
-            resolve_location("http://10.245.2.20/", "/eportal/index.jsp").as_deref(),
-            Some("http://10.245.2.20/eportal/index.jsp")
+    fn network_errors_hide_url_session_parameters() {
+        // Binding without accepting prevents port reuse while the request times out.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = format!(
+            "http://{}/eportal/index.jsp?wlanuserip=SECRET&mac=SECRETMAC",
+            listener.local_addr().unwrap()
         );
-        // 绝对地址原样保留
-        let absolute = "https://sso.yzu.edu.cn/login?service=x";
-        assert_eq!(resolve_location("http://10.245.2.20/", absolute).as_deref(), Some(absolute));
-        // 基准地址本身非法时不应panic
-        assert!(resolve_location("不是合法的地址", "/a").is_none());
+        let error = Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(target)
+            .timeout(Duration::from_millis(100))
+            .send()
+            .unwrap_err();
+        let message = LoginError::from_reqwest(error).to_string();
+        assert!(!message.contains("SECRET"));
     }
 
     #[test]
-    fn redacts_personal_parameters_from_log_output() {
-        let with_secrets = "http://10.245.2.20/eportal/index.jsp?wlanuserip=SECRETIP&mac=SECRETMAC";
-        let safe = redact(with_secrets);
-        assert_eq!(safe, "http://10.245.2.20/eportal/index.jsp?[wlanuserip,mac]");
-        assert!(!safe.contains("SECRETIP"));
-        assert!(!safe.contains("SECRETMAC"));
-        // 无参数时保持原样
-        assert_eq!(redact("http://10.245.2.20/"), "http://10.245.2.20/");
-        // 带端口时端口要保留，且不能多出一个 `?`
-        assert_eq!(redact("http://10.245.2.20:8080/a?x=1"), "http://10.245.2.20:8080/a?[x]");
-        assert_eq!(redact("不是合法的地址"), "<无法解析的地址>");
-    }
-
-    #[test]
-    fn only_accepts_private_hosts_for_login() {
-        // 校园网门户是私有地址，可以发凭据
-        assert!(is_private_host("10.245.2.20"));
-        assert!(is_private_host("192.168.1.1"));
-        // 公网地址和域名一律拒绝，避免密码被发到外部主机
-        assert!(!is_private_host("8.8.8.8"));
-        assert!(!is_private_host("evil.example"));
-        assert!(!is_private_host(""));
-    }
-
-    #[test]
-    fn extracts_sso_entry_from_portal_page_body() {
-        // 网关不用 302 时，认证入口只在正文里
-        let body = r#"<html><a href="https://sso.yzu.edu.cn/login?service=http%3A%2F%2F10.245.2.20%2Feportal%2Findex.jsp">登录</a></html>"#;
-        let url = auth_url_from_text(body).expect("应从正文中取到入口");
-        assert!(url.starts_with("https://sso.yzu.edu.cn/login?service="));
-        assert!(entry_from_url(&url).is_some());
-    }
-
-    #[test]
-    fn unescapes_html_entities_in_body_url() {
-        // 正文里的查询参数是 HTML 转义的，取出后要还原，否则参数会被拼错
-        let body = r#"<a href="https://sso.yzu.edu.cn/login?service=http%3A%2F%2F10.245.2.20%2F&amp;t=wireless-v2">x</a>"#;
-        let url = auth_url_from_text(body).expect("应从正文中取到入口");
-        assert!(!url.contains("&amp;"));
-        assert!(url.contains("&t=wireless-v2"));
-    }
-
-    #[test]
-    fn ignores_body_without_a_usable_sso_link() {
-        assert!(auth_url_from_text("<html>普通页面</html>").is_none());
-        // 出现 SSO 域名但不是地址形式时不应误判
-        assert!(auth_url_from_text("联系 sso.yzu.edu.cn 管理员").is_none());
+    fn raw_fallback_does_not_send_plaintext_for_https() {
+        assert!(split_target("https://10.245.2.20/eportal/index.jsp?wlanuserip=test").is_err());
     }
 
     #[test]

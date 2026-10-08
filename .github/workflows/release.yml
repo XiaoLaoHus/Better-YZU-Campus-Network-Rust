@@ -68,7 +68,7 @@ jobs:
           import os, tomllib
           with open('Cargo.toml', 'rb') as file:
               version = tomllib.load(file)['package']['version']
-          assert os.environ['GITHUB_REF_NAME'] == f'v{version}', '标签与 Cargo.toml 版本不一致'
+          assert os.environ['GITHUB_REF_NAME'] == f'v{version.replace("+lite", "Lite")}', '标签与 Cargo.toml 版本不一致'
           PY
 
       - name: 单元测试
@@ -107,7 +107,7 @@ jobs:
         shell: bash
         run: |
           cp config.example.toml config.toml
-          sed -i 's/^user_id = ""/user_id = "ci-test-user"/; s/^password = ""/password = "ci-test-password"/' config.toml
+          sed -i 's/^user_id = ""/user_id = "ci-test-user"/; s/^password = ""/password = "ci-test-password"/; s|^auth_url = ""|auth_url = "http://10.245.2.20:9/eportal/index.jsp?wlanuserip=ci-test"|' config.toml
 
           set -o pipefail
           timeout 120 "./target/${{ matrix.target }}/release/${BIN_NAME}" --once | tee run.log

@@ -71,9 +71,9 @@ jobs:
         shell: bash
         run: |
           cp config.example.toml config.toml
-          sed -i 's/^user_id = ""/user_id = "ci-test-user"/; s/^password = ""/password = "ci-test-password"/' config.toml
+          sed -i 's/^user_id = ""/user_id = "ci-test-user"/; s/^password = ""/password = "ci-test-password"/; s|^auth_url = ""|auth_url = "http://10.245.2.20:9/eportal/index.jsp?wlanuserip=ci-test"|' config.toml
           set -o pipefail
-          timeout 30 "./target/release/${BIN_NAME}" --once | tee run.log
+          timeout 90 "./target/release/${BIN_NAME}" --once | tee run.log
           grep -q "启动了喵" run.log
           "./target/release/${BIN_NAME}" --help
           # GitHub 不在校园网中；这里验证启动，不声称实际登录成功。

@@ -1,4 +1,7 @@
-use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily, FontId, Margin, RichText, Stroke, TextStyle};
+use eframe::egui::{
+    self, Color32, FontData, FontDefinitions, FontFamily, FontId, Margin, RichText, Stroke,
+    TextStyle,
+};
 
 pub const BACKGROUND: Color32 = Color32::from_rgb(245, 246, 250);
 pub const CARD: Color32 = Color32::WHITE;
@@ -9,15 +12,30 @@ const INPUT_MARGIN: Margin = Margin::symmetric(12, 8);
 const INPUT_HEIGHT: f32 = 42.0;
 
 pub fn setup(ctx: &egui::Context) -> Result<(), String> {
-    let root = std::env::var_os("WINDIR").map(std::path::PathBuf::from)
-        .unwrap_or_else(|| "C:/Windows".into()).join("Fonts");
+    let root = std::env::var_os("WINDIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| "C:/Windows".into())
+        .join("Fonts");
     let mut fonts = FontDefinitions::default();
-    let bytes = ["msyh.ttc", "msyh.ttf", "simhei.ttf", "simsun.ttc", "NotoSansSC.ttf"]
-        .iter().find_map(|name| std::fs::read(root.join(name)).ok())
-        .ok_or("未找到可用中文字体（微软雅黑、黑体或宋体），请检查 Windows 字体安装。")?;
-    fonts.font_data.insert("chinese".into(), FontData::from_owned(bytes).into());
+    let bytes = [
+        "msyh.ttc",
+        "msyh.ttf",
+        "simhei.ttf",
+        "simsun.ttc",
+        "NotoSansSC.ttf",
+    ]
+    .iter()
+    .find_map(|name| std::fs::read(root.join(name)).ok())
+    .ok_or("未找到可用中文字体（微软雅黑、黑体或宋体），请检查 Windows 字体安装。")?;
+    fonts
+        .font_data
+        .insert("chinese".into(), FontData::from_owned(bytes).into());
     for family in [FontFamily::Proportional, FontFamily::Monospace] {
-        fonts.families.get_mut(&family).unwrap().insert(0, "chinese".into());
+        fonts
+            .families
+            .get_mut(&family)
+            .unwrap()
+            .insert(0, "chinese".into());
     }
     ctx.set_fonts(fonts);
     let mut style = (*ctx.style()).clone();
@@ -27,22 +45,37 @@ pub fn setup(ctx: &egui::Context) -> Result<(), String> {
     style.visuals.extreme_bg_color = Color32::from_rgb(248, 250, 253);
     style.visuals.override_text_color = Some(Color32::from_rgb(38, 47, 65));
     style.visuals.selection.bg_fill = Color32::from_rgb(206, 223, 255);
-    for widget in [&mut style.visuals.widgets.inactive, &mut style.visuals.widgets.hovered, &mut style.visuals.widgets.active] {
+    for widget in [
+        &mut style.visuals.widgets.inactive,
+        &mut style.visuals.widgets.hovered,
+        &mut style.visuals.widgets.active,
+    ] {
         widget.corner_radius = 8.into();
     }
     style.spacing.item_spacing = egui::vec2(12.0, 10.0);
     style.spacing.button_padding = egui::vec2(16.0, 9.0);
     style.spacing.interact_size.y = INPUT_HEIGHT;
-    style.text_styles.insert(TextStyle::Body, FontId::proportional(15.0));
-    style.text_styles.insert(TextStyle::Button, FontId::proportional(15.0));
-    style.text_styles.insert(TextStyle::Heading, FontId::proportional(26.0));
-    style.text_styles.insert(TextStyle::Small, FontId::proportional(12.0));
+    style
+        .text_styles
+        .insert(TextStyle::Body, FontId::proportional(15.0));
+    style
+        .text_styles
+        .insert(TextStyle::Button, FontId::proportional(15.0));
+    style
+        .text_styles
+        .insert(TextStyle::Heading, FontId::proportional(26.0));
+    style
+        .text_styles
+        .insert(TextStyle::Small, FontId::proportional(12.0));
     ctx.set_style(style);
     Ok(())
 }
 
 pub fn card() -> egui::Frame {
-    egui::Frame::new().fill(CARD).corner_radius(14).inner_margin(Margin::same(20))
+    egui::Frame::new()
+        .fill(CARD)
+        .corner_radius(14)
+        .inner_margin(Margin::same(20))
         .stroke(Stroke::new(1.0_f32, Color32::from_rgb(230, 234, 242)))
 }
 
@@ -51,9 +84,13 @@ pub fn primary(text: &str) -> egui::Button<'_> {
 }
 
 pub fn input<'a>(text: &'a mut String, id: &str, password: bool) -> egui::TextEdit<'a> {
-    egui::TextEdit::singleline(text).id(egui::Id::new(id)).password(password)
-        .horizontal_align(egui::Align::Center).vertical_align(egui::Align::Center)
-        .margin(INPUT_MARGIN).min_size(egui::vec2(0.0, INPUT_HEIGHT))
+    egui::TextEdit::singleline(text)
+        .id(egui::Id::new(id))
+        .password(password)
+        .horizontal_align(egui::Align::Center)
+        .vertical_align(egui::Align::Center)
+        .margin(INPUT_MARGIN)
+        .min_size(egui::vec2(0.0, INPUT_HEIGHT))
         .desired_width(f32::INFINITY)
 }
 
@@ -76,12 +113,20 @@ mod tests {
                             let output = input(&mut text, "center-test", password).show(ui);
                             let text_center = output.galley_pos + output.galley.size() / 2.0;
                             let center = output.response.rect.center();
-                            assert!((text_center.x - center.x).abs() <= 1.0, "horizontal centering at {scale}x");
-                            assert!((text_center.y - center.y).abs() <= 1.0, "vertical centering at {scale}x");
+                            assert!(
+                                (text_center.x - center.x).abs() <= 1.0,
+                                "horizontal centering at {scale}x"
+                            );
+                            assert!(
+                                (text_center.y - center.y).abs() <= 1.0,
+                                "vertical centering at {scale}x"
+                            );
                             // egui 0.31 的 TextEditOutput 返回的是去掉 margin 的内框，补回边距才是实际框高。
                             let box_height = output.response.rect.height() + INPUT_MARGIN.sum().y;
                             assert!(box_height >= INPUT_HEIGHT, "input box height at {scale}x");
-                            if password { assert!(!output.galley.text().contains("123456789")); }
+                            if password {
+                                assert!(!output.galley.text().contains("123456789"));
+                            }
                         });
                     });
                 }

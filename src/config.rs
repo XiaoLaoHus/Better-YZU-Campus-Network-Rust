@@ -15,7 +15,7 @@ pub const CONFIG_FILE: &str = "config.toml";
 pub const EXAMPLE_CONFIG_FILE: &str = "config.example.toml";
 
 /// 用户配置。对应原 Python 脚本开头的 USER_ID / PASSWORD / SERVICE_INDEX，
-/// 外加两个可选的高级配置项。
+/// 外加手动填写的认证 URL 和两个可选的高级配置项。
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
     /// 学工号 / 统一身份认证账号
@@ -26,6 +26,10 @@ pub struct Config {
 
     /// 网络服务索引，取值 1..=5
     pub service_index: usize,
+
+    /// 浏览器中的完整认证地址；旧配置缺少此字段时保留其他信息，等待补填。
+    #[serde(default)]
+    pub auth_url: String,
 
     /// 重连检查间隔（秒）
     #[serde(default = "default_interval_secs")]
@@ -47,6 +51,7 @@ impl Default for Config {
             user_id: String::new(),
             password: String::new(),
             service_index: 1,
+            auth_url: String::new(),
             interval_secs: default_interval_secs(),
             danger_accept_invalid_certs: false,
         }
@@ -65,21 +70,34 @@ impl Config {
 
         self.validate().map_err(|error| error.to_string())?;
         let contents = toml::to_string_pretty(self).map_err(|_| "无法序列化配置。".to_owned())?;
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
         let name = path.file_name().ok_or("配置路径必须指向文件。")?;
         let mut temporary_name = name.to_os_string();
         temporary_name.push(format!(".{}.{}.tmp", std::process::id(), stamp));
         let temporary = path.with_file_name(temporary_name);
         let mut created = false;
         let result = (|| -> std::io::Result<()> {
-            let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
             created = true;
             file.write_all(contents.as_bytes())?;
             file.sync_all()?;
             drop(file);
             let from: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
             let to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-            if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } == 0 {
+            if unsafe {
+                MoveFileExW(
+                    from.as_ptr(),
+                    to.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            } == 0
+            {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -88,7 +106,9 @@ impl Config {
             let _ = fs::remove_file(&temporary);
         }
         // No TOML text or credentials in the error channel.
-        result.map_err(|error| format!("保存失败：{error}。请检查配置目录是否存在且可写；原配置未改动。"))
+        result.map_err(|error| {
+            format!("保存失败：{error}。请检查配置目录是否存在且可写；原配置未改动。")
+        })
     }
 
     /// 从指定路径读取并解析配置。
@@ -120,6 +140,9 @@ impl Config {
             return Err(ConfigError::IntervalTooSmall);
         }
 
+        crate::login::validate_auth_url(&self.auth_url)
+            .map_err(|error| ConfigError::InvalidAuthUrl(error.to_string()))?;
+
         Ok(())
     }
 }
@@ -143,6 +166,8 @@ pub enum ConfigError {
     InvalidServiceIndex(usize),
     /// interval_secs 为 0，会导致忙循环
     IntervalTooSmall,
+    /// 认证 URL 缺失或无法用于校园网登录。
+    InvalidAuthUrl(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -169,6 +194,7 @@ impl fmt::Display for ConfigError {
             ConfigError::IntervalTooSmall => {
                 write!(f, "interval_secs 必须大于 0。")
             }
+            ConfigError::InvalidAuthUrl(message) => write!(f, "{message}"),
         }
     }
 }
@@ -188,7 +214,7 @@ mod tests {
     use super::*;
 
     fn valid() -> Config {
-        toml::from_str("user_id = 'test-user'\npassword = 'test-password'\nservice_index = 1").unwrap()
+        toml::from_str("user_id = 'test-user'\npassword = 'test-password'\nservice_index = 1\nauth_url = 'http://10.245.2.20/eportal/index.jsp?wlanuserip=test'").unwrap()
     }
 
     #[test]
@@ -206,24 +232,88 @@ mod tests {
     fn rejects_invalid_configuration() {
         let mut config = valid();
         config.user_id = "  ".into();
-        assert!(matches!(config.validate(), Err(ConfigError::MissingCredentials)));
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::MissingCredentials)
+        ));
         config = valid();
         config.password.clear();
         assert!(config.validate().is_err());
         config = valid();
         for service in [0, SERVICE_COUNT + 1] {
             config.service_index = service;
-            assert!(matches!(config.validate(), Err(ConfigError::InvalidServiceIndex(_))));
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigError::InvalidServiceIndex(_))
+            ));
         }
         config = valid();
         config.interval_secs = 0;
-        assert!(matches!(config.validate(), Err(ConfigError::IntervalTooSmall)));
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::IntervalTooSmall)
+        ));
     }
 
     #[test]
     fn parse_error_does_not_display_credentials() {
         let source = toml::from_str::<Config>("password = secret-password").unwrap_err();
-        let error = ConfigError::Parse { path: "config.toml".into(), source: Box::new(source) };
+        let error = ConfigError::Parse {
+            path: "config.toml".into(),
+            source: Box::new(source),
+        };
         assert!(!error.to_string().contains("secret-password"));
+    }
+
+    #[test]
+    fn old_config_preserves_credentials_but_requires_manual_url() {
+        let mut config: Config =
+            toml::from_str("user_id = 'test-user'\npassword = 'test-password'\nservice_index = 2")
+                .unwrap();
+        assert_eq!(config.user_id, "test-user");
+        assert_eq!(config.password, "test-password");
+        assert_eq!(config.service_index, 2);
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidAuthUrl(_))
+        ));
+        config.auth_url =
+            "http://10.245.2.20/eportal/index.jsp?wlanuserip=test&mac=test-mac".into();
+        let saved = toml::to_string(&config).unwrap();
+        let loaded: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(loaded.auth_url, config.auth_url);
+        assert!(loaded.validate().is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn filling_legacy_url_saves_credentials_and_advanced_settings() {
+        struct TemporaryFile(PathBuf);
+        impl Drop for TemporaryFile {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let file = TemporaryFile(
+            std::env::temp_dir().join(format!("yzu-config-{}-{stamp}.toml", std::process::id())),
+        );
+        let old = "user_id = 'test-user'\npassword = 'test-password'\nservice_index = 2\ninterval_secs = 617\ndanger_accept_invalid_certs = true\n";
+        fs::write(&file.0, old).unwrap();
+        let mut config = Config::load(&file.0).unwrap();
+        assert!(config.save(&file.0).is_err());
+        assert_eq!(fs::read_to_string(&file.0).unwrap(), old);
+        config.auth_url = "http://10.245.2.20/eportal/index.jsp?wlanuserip=test".into();
+        config.save(&file.0).unwrap();
+        let loaded = Config::load(&file.0).unwrap();
+        assert_eq!(loaded.auth_url, config.auth_url);
+        assert_eq!(loaded.user_id, "test-user");
+        assert_eq!(loaded.password, "test-password");
+        assert_eq!(loaded.service_index, 2);
+        assert_eq!(loaded.interval_secs, 617);
+        assert!(loaded.danger_accept_invalid_certs);
     }
 }

@@ -160,7 +160,10 @@ def exercise(exe, config, env, *, minimized=False, missing=False, first_run=Fals
                 type_into(window, "学工号 / 账号", "ci-ui-user")
                 type_into(window, "校园网密码", "ci-ui-password")
             service = wait_until(lambda: control_for(window, "网络服务", "ComboBox"), "service selector")
-            service.click_input()
+            # Focus through UIA before opening with the keyboard. Coordinate
+            # clicks can be lost when the runner changes window/DPI geometry.
+            service.set_focus()
+            keyboard.send_keys("{SPACE}", pause=0.1)
             click(window, "联通互联网服务")
             screenshot(window, "centered-inputs")
             before = config.read_bytes() if config.exists() else None
@@ -237,7 +240,7 @@ def exercise(exe, config, env, *, minimized=False, missing=False, first_run=Fals
             try:
                 screenshot(window, "failure")
                 (SCREENSHOTS / "uia-failure.txt").write_text(
-                    "\n".join(f"{c.element_info.control_type}: {c.element_info.name}" for c in controls(window)),
+                    "\n".join(f"{c.element_info.control_type}: {c.element_info.name}; bounds={c.rectangle()}" for c in controls(window)),
                     encoding="utf-8",
                 )
             except Exception as error:

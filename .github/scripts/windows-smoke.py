@@ -6,6 +6,9 @@ All application state is isolated from the runner's/user's LocalAppData.
 import ctypes
 from ctypes import wintypes
 import hashlib
+import http.server
+import threading
+import urllib.parse
 import os
 import pathlib
 import subprocess
@@ -32,6 +35,35 @@ SCREENSHOTS = pathlib.Path("artifacts/windows-ui")
 # A synthetic address with a closed port; no personal parameters or actual login.
 AUTH_URL = "http://10.245.2.20:9/eportal/index.jsp?wlanuserip=ci-session&mac=ci-mac"
 UPDATED_AUTH_URL = AUTH_URL.replace("ci-session", "ci-updated-session")
+AUTH_LABEL = "SSO 认证网址（可选）"
+MOCK_REQUESTS = []
+
+
+class MockGateway(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *_):
+        pass
+
+    def do_GET(self):
+        MOCK_REQUESTS.append(("GET", self.path))
+        portal = urllib.parse.urlsplit(self.path).hostname == "10.245.2.20"
+        body = b"portal" if portal else b""
+        self.send_response(200 if portal else 302)
+        if portal:
+            self.send_header("Set-Cookie", "JSESSIONID=ci-session; Path=/")
+        else:
+            self.send_header("Location", AUTH_URL)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        MOCK_REQUESTS.append(("POST", self.path))
+        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        body = b'{"result":"success"}'
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
 
 def wait_until(check, description, timeout=30):
@@ -97,7 +129,7 @@ def click(window, name):
 def type_into(window, name, value):
     edit = wait_until(lambda: control_for(window, name, "Edit"), f"input {name}")
     edit.click_input()
-    keyboard.send_keys("^a" + value, pause=0.03, with_spaces=True)
+    keyboard.send_keys("^a{BACKSPACE}" + value, pause=0.03, with_spaces=True)
 
 
 def post(hwnd, message, w=0, l=0):
@@ -148,17 +180,13 @@ def exercise(exe, config, env, *, minimized=False, missing=False, first_run=Fals
         window = Desktop(backend="uia").window(handle=hwnd).wrapper_object()
         check_notice(window, hwnd, state, first_run)
         shell_available = bool(user32.FindWindowW("Shell_TrayWnd", None))
-        if missing or legacy:
-            wait_until(lambda: has_text(window, "请填写认证 URL" if legacy else "欢迎使用"), "configuration editor")
-            assert user32.IsWindowVisible(hwnd), "Missing URL or configuration must show editor"
-            assert not has_text(window, "启动了喵"), "A missing URL must prevent network requests"
+        if missing:
+            wait_until(lambda: has_text(window, "欢迎使用"), "configuration editor")
+            assert user32.IsWindowVisible(hwnd), "Missing configuration must show editor"
+            assert not has_text(window, "启动了喵"), "Missing credentials must prevent network requests"
             screenshot(window, "empty-editor")
-            if legacy:
-                edit = control_for(window, "学工号 / 账号", "Edit")
-                assert edit.get_value() == "ci-test-user", "Legacy account must be preserved"
-            else:
-                type_into(window, "学工号 / 账号", "ci-ui-user")
-                type_into(window, "校园网密码", "ci-ui-password")
+            type_into(window, "学工号 / 账号", "ci-ui-user")
+            type_into(window, "校园网密码", "ci-ui-password")
             service = wait_until(lambda: control_for(window, "网络服务", "ComboBox"), "service selector")
             # Focus through UIA before opening with the keyboard. Coordinate
             # clicks can be lost when the runner changes window/DPI geometry.
@@ -167,20 +195,29 @@ def exercise(exe, config, env, *, minimized=False, missing=False, first_run=Fals
             click(window, "联通互联网服务")
             screenshot(window, "centered-inputs")
             before = config.read_bytes() if config.exists() else None
+            type_into(window, AUTH_LABEL, "https://sso.yzu.edu.cn/login")
             click(window, "保存并连接")
-            wait_until(lambda: has_text(window, "请填写认证 URL"), "missing URL validation")
+            wait_until(lambda: has_text(window, "缺少 service 参数"), "invalid optional URL validation")
             assert (config.read_bytes() if config.exists() else None) == before
             assert not has_text(window, "启动了喵")
-            type_into(window, "认证 URL", "https://sso.yzu.edu.cn/login")
+            type_into(window, AUTH_LABEL, "")
             click(window, "保存并连接")
-            wait_until(lambda: has_text(window, "缺少 service 参数"), "invalid URL validation")
-            assert (config.read_bytes() if config.exists() else None) == before
-            type_into(window, "认证 URL", AUTH_URL)
+            wait_until(config.exists, "save configuration without optional URL")
+            assert tomllib.loads(config.read_text(encoding="utf-8"))["auth_url"] == ""
+            wait_until(lambda: has_text(window, "未填写 SSO 认证网址"), "empty URL selects discovery")
+            click(window, "停止重连")
+            wait_until(lambda: has_text(window, "自动重连已停止"), "stop automatic login", timeout=90)
+            request_count = len(MOCK_REQUESTS)
+            type_into(window, AUTH_LABEL, AUTH_URL)
             click(window, "保存并连接")
-            wait_until(lambda: config.exists() and AUTH_URL in config.read_text(encoding="utf-8"), "save URL configuration")
+            wait_until(lambda: AUTH_URL in config.read_text(encoding="utf-8"), "save optional URL override")
+            wait_until(lambda: has_text(window, "使用手动填写的 SSO 认证网址"), "manual URL bypasses discovery")
+            wait_until(lambda: any(method == "POST" for method, _ in MOCK_REQUESTS[request_count:]), "manual login completes")
+            assert all(urllib.parse.urlsplit(target).hostname == "10.245.2.20"
+                       for _, target in MOCK_REQUESTS[request_count:]), "Manual URL must skip external probes"
             saved = tomllib.loads(config.read_text(encoding="utf-8"))
-            assert saved["user_id"] == ("ci-test-user" if legacy else "ci-ui-user")
-            assert saved["password"] == ("ci-test-password" if legacy else "ci-ui-password")
+            assert saved["user_id"] == "ci-ui-user"
+            assert saved["password"] == "ci-ui-password"
             assert saved["service_index"] == 2
             assert saved["auth_url"] == AUTH_URL
             wait_until(lambda: has_text(window, "启动了喵"), "worker starts after save")
@@ -198,7 +235,7 @@ def exercise(exe, config, env, *, minimized=False, missing=False, first_run=Fals
             screenshot(window, "running-minimized" if minimized else "running")
             if not minimized:
                 type_into(window, "学工号 / 账号", "ci-updated-user")
-                type_into(window, "认证 URL", UPDATED_AUTH_URL)
+                type_into(window, AUTH_LABEL, UPDATED_AUTH_URL)
                 click(window, "保存并连接")
                 if shell_available:
                     post(hwnd, 0x0010)
@@ -214,7 +251,10 @@ def exercise(exe, config, env, *, minimized=False, missing=False, first_run=Fals
                     restore(hwnd)
         all_text = "\n".join(control.element_info.name for control in controls(window))
         assert "ci-ui-password" not in all_text and "ci-test-password" not in all_text, "Password must be masked in UIA"
-        assert "探测 http" not in all_text, "Manual URL login must not discover an entry"
+        if legacy:
+            assert "未填写 SSO 认证网址" in all_text, "Legacy config must use automatic discovery"
+        elif not missing:
+            assert "探测 http" not in all_text, "Manual URL login must not discover an entry"
         if shell_available:
             post(hwnd, 0x0010)
             wait_until(lambda: not user32.IsWindowVisible(hwnd), "close hides to tray")
@@ -273,29 +313,38 @@ def main():
     ensure_ci_font()
     with tempfile.TemporaryDirectory(prefix="yzu-smoke-") as directory:
         root = pathlib.Path(directory)
-        env = dict(os.environ, LOCALAPPDATA=str(root / "local-app-data"))
-        state = pathlib.Path(env["LOCALAPPDATA"]) / "Better-YZU-Campus-Network" / "ui-state.toml"
-        config = root / "config.toml"
-        config.write_text(f'user_id = "ci-test-user"\npassword = "ci-test-password"\nservice_index = 1\nauth_url = "{AUTH_URL}"\ninterval_secs = 617\ndanger_accept_invalid_certs = false\n', encoding="utf-8")
-        legacy = root / "legacy.toml"
-        legacy.write_text('user_id = "ci-test-user"\npassword = "ci-test-password"\nservice_index = 1\n', encoding="utf-8")
-        result = subprocess.run([str(exe), "--help"], env=env, capture_output=True, timeout=10)
-        assert result.returncode == 0 and b"--minimized" in result.stdout
-        result = subprocess.run([str(exe), "--once", "--config", str(config)], env=env, capture_output=True, timeout=90)
-        assert result.returncode == 0 and "启动了喵".encode() in result.stdout
-        assert b"ci-session" not in result.stdout and b"ci-mac" not in result.stdout
-        result = subprocess.run([str(exe), "--once", "--config", str(legacy)], env=env, capture_output=True, timeout=10)
-        assert result.returncode == 1 and "请填写认证 URL".encode() in result.stdout
-        result = subprocess.run([str(exe), "--once", "--config", str(root / "missing.toml")], env=env, capture_output=True, timeout=10)
-        assert result.returncode == 1
-        assert not state.exists(), "CLI must not acknowledge or create GUI state"
-        print("PASS: console help, --once, config errors; no GUI state created")
-        # First-run --minimized + valid config must still require acknowledgement.
-        exercise(exe, config, env, minimized=True, first_run=True)
-        exercise(exe, config, env)
-        exercise(exe, config, env, minimized=True)
-        exercise(exe, root / "missing.toml", env, minimized=True, missing=True)
-        exercise(exe, legacy, env, minimized=True, legacy=True)
+        with http.server.ThreadingHTTPServer(("127.0.0.1", 0), MockGateway) as proxy:
+            threading.Thread(target=proxy.serve_forever, daemon=True).start()
+            try:
+                env = dict(os.environ, LOCALAPPDATA=str(root / "local-app-data"))
+                proxy_url = f"http://127.0.0.1:{proxy.server_address[1]}"
+                env.update(HTTP_PROXY=proxy_url, http_proxy=proxy_url, HTTPS_PROXY=proxy_url,
+                           https_proxy=proxy_url, NO_PROXY="", no_proxy="")
+                state = pathlib.Path(env["LOCALAPPDATA"]) / "Better-YZU-Campus-Network" / "ui-state.toml"
+                config = root / "config.toml"
+                config.write_text(f'user_id = "ci-test-user"\npassword = "ci-test-password"\nservice_index = 1\nauth_url = "{AUTH_URL}"\ninterval_secs = 617\ndanger_accept_invalid_certs = false\n', encoding="utf-8")
+                legacy = root / "legacy.toml"
+                legacy.write_text('user_id = "ci-test-user"\npassword = "ci-test-password"\nservice_index = 1\n', encoding="utf-8")
+                result = subprocess.run([str(exe), "--help"], env=env, capture_output=True, timeout=10)
+                assert result.returncode == 0 and b"--minimized" in result.stdout
+                result = subprocess.run([str(exe), "--once", "--config", str(config)], env=env, capture_output=True, timeout=90)
+                assert result.returncode == 0 and "启动了喵".encode() in result.stdout
+                assert b"ci-session" not in result.stdout and b"ci-mac" not in result.stdout
+                result = subprocess.run([str(exe), "--once", "--config", str(legacy)], env=env, capture_output=True, timeout=10)
+                assert result.returncode == 0 and "未填写 SSO 认证网址".encode() in result.stdout
+                result = subprocess.run([str(exe), "--once", "--config", str(root / "missing.toml")], env=env, capture_output=True, timeout=10)
+                assert result.returncode == 1
+                assert not state.exists(), "CLI must not acknowledge or create GUI state"
+                print("PASS: console help, --once, config errors; no GUI state created")
+                # First-run --minimized + valid config must still require acknowledgement.
+                exercise(exe, config, env, minimized=True, first_run=True)
+                exercise(exe, config, env)
+                exercise(exe, config, env, minimized=True)
+                exercise(exe, root / "missing.toml", env, minimized=True, missing=True)
+                exercise(exe, legacy, env, minimized=True, legacy=True)
+            finally:
+                proxy.shutdown()
+
 
 
 if __name__ == "__main__":

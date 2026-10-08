@@ -123,10 +123,12 @@ impl App {
             ctx.memory_mut(|memory| memory.request_focus(egui::Id::new(id)));
             return;
         }
-        if let Err(error) = crate::login::validate_auth_url(&config.auth_url) {
-            self.status = error.to_string();
-            ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("auth-url")));
-            return;
+        if !config.auth_url.is_empty() {
+            if let Err(error) = crate::login::validate_auth_url(&config.auth_url) {
+                self.status = error.to_string();
+                ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("auth-url")));
+                return;
+            }
         }
         if let Err(error) = config.save(&self.path) {
             self.status = "配置未保存 · 当前后台任务不受影响".into();
@@ -134,7 +136,7 @@ impl App {
             return;
         }
         self.append(
-            "配置已保存，将使用手动填写的认证 URL 连接。账号、密码和 URL 参数不会显示在日志中。",
+            "配置已保存。填写认证网址时直接使用，留空时自动获取；账号、密码和 URL 参数不会显示在日志中。",
         );
         if self.worker.is_some() {
             self.pending = Some(config);
@@ -167,7 +169,7 @@ impl App {
         self.dialog = None;
         self.tray.set_allow_hide(false);
         self.tray.restore();
-        self.status = "正在退出 · 等待当前认证请求结束…".into();
+        self.status = "正在退出 · 等待当前探测 / 认证请求结束…".into();
         self.request_stop();
     }
 
@@ -230,8 +232,11 @@ impl App {
         if let Some(config) = self.initial.take() {
             self.start(config);
         } else {
-            self.append("请填写账号、密码和完整认证 URL，并选择服务；首次保存使用默认高级设置。");
-            let id = if !self.user_id.is_empty() && !self.password.is_empty() {
+            self.append("请填写账号、密码并选择服务；SSO 认证网址可选，留空时自动获取。");
+            let id = if !self.auth_url.is_empty()
+                && !self.user_id.is_empty()
+                && !self.password.is_empty()
+            {
                 "auth-url"
             } else {
                 "user-id"
@@ -283,12 +288,12 @@ impl App {
                 columns[1].label(RichText::new("默认每 10 分钟检查一次\n密码仅以明文保存在本机配置文件").small().color(style::MUTED));
             });
             ui.add_space(8.0);
-            let label = ui.label("认证 URL");
+            let label = ui.label("SSO 认证网址（可选）");
             ui.add(style::input(&mut self.auth_url, "auth-url", false)
                 .horizontal_align(egui::Align::Min)
-                .hint_text("粘贴浏览器地址栏中的完整校园网认证 URL"))
+                .hint_text("可选：粘贴浏览器地址栏中的完整认证网址"))
                 .labelled_by(label.id);
-            ui.label(RichText::new("支持 SSO 登录地址或带参数的门户地址；重连使用此 URL，地址失效时请重新复制并保存。")
+            ui.label(RichText::new("填写时直接使用，跳过自动获取；留空时自动获取认证地址。网址失效时请更新或清空。")
                 .small().color(style::MUTED));
         });
         ui.add_space(2.0);
@@ -530,7 +535,7 @@ pub fn run(path: PathBuf, minimized: bool) -> Result<(), Box<dyn Error>> {
                 Err(ConfigError::Read { source, .. })
                     if source.kind() == std::io::ErrorKind::NotFound =>
                 {
-                    "欢迎使用 · 填写账号、密码、服务和认证 URL，即可连接".into()
+                    "欢迎使用 · 填写账号、密码并选择服务，即可连接".into()
                 }
                 Err(_) => "配置无法读取 · 请检查文件或在表单中重新设置".into(),
             };

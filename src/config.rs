@@ -27,7 +27,7 @@ pub struct Config {
     /// 网络服务索引，取值 1..=5
     pub service_index: usize,
 
-    /// 浏览器中的完整认证地址；旧配置缺少此字段时保留其他信息，等待补填。
+    /// 可选的完整认证地址；空值或缺失时自动获取，填写时优先直接使用。
     #[serde(default)]
     pub auth_url: String,
 
@@ -140,8 +140,10 @@ impl Config {
             return Err(ConfigError::IntervalTooSmall);
         }
 
-        crate::login::validate_auth_url(&self.auth_url)
-            .map_err(|error| ConfigError::InvalidAuthUrl(error.to_string()))?;
+        if !self.auth_url.trim().is_empty() {
+            crate::login::validate_auth_url(&self.auth_url)
+                .map_err(|error| ConfigError::InvalidAuthUrl(error.to_string()))?;
+        }
 
         Ok(())
     }
@@ -266,17 +268,15 @@ mod tests {
     }
 
     #[test]
-    fn old_config_preserves_credentials_but_requires_manual_url() {
+    fn old_config_uses_automatic_discovery_and_keeps_manual_override() {
         let mut config: Config =
             toml::from_str("user_id = 'test-user'\npassword = 'test-password'\nservice_index = 2")
                 .unwrap();
         assert_eq!(config.user_id, "test-user");
         assert_eq!(config.password, "test-password");
         assert_eq!(config.service_index, 2);
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigError::InvalidAuthUrl(_))
-        ));
+        assert!(config.auth_url.is_empty());
+        assert!(config.validate().is_ok());
         config.auth_url =
             "http://10.245.2.20/eportal/index.jsp?wlanuserip=test&mac=test-mac".into();
         let saved = toml::to_string(&config).unwrap();
@@ -304,6 +304,7 @@ mod tests {
         let old = "user_id = 'test-user'\npassword = 'test-password'\nservice_index = 2\ninterval_secs = 617\ndanger_accept_invalid_certs = true\n";
         fs::write(&file.0, old).unwrap();
         let mut config = Config::load(&file.0).unwrap();
+        config.auth_url = "not a URL".into();
         assert!(config.save(&file.0).is_err());
         assert_eq!(fs::read_to_string(&file.0).unwrap(), old);
         config.auth_url = "http://10.245.2.20/eportal/index.jsp?wlanuserip=test".into();

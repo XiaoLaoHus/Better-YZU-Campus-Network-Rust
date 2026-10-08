@@ -1294,6 +1294,11 @@ mod tests {
             .unwrap()
     }
 
+    fn test_config() -> Config {
+        toml::from_str("user_id = 'test-user'\npassword = 'test-password'\nservice_index = 1")
+            .unwrap()
+    }
+
     #[test]
     fn html_login_response_retries_direct_with_its_own_session_cookie() {
         let (address, server) = mock_responses(vec![
@@ -1308,7 +1313,7 @@ mod tests {
                 "Content-Type: application/json\r\n",
             ),
         ]);
-        let mut gateway = Gateway::new(&Config::default()).unwrap();
+        let mut gateway = Gateway::new(&test_config()).unwrap();
         gateway.login_proxy = proxy_client(address);
         gateway.login_direct = proxy_client(address);
         let portal = "http://10.245.2.20/eportal/index.jsp?wlanuserip=SESSION";
@@ -1339,7 +1344,7 @@ mod tests {
             response("external page", ""),
             format!("HTTP/1.1 302 Found\r\nLocation: {portal}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
         ]);
-        let mut gateway = Gateway::new(&Config::default()).unwrap();
+        let mut gateway = Gateway::new(&test_config()).unwrap();
         gateway.detect_proxy = proxy_client(address);
         gateway.detect_direct = proxy_client(address);
         let Discovery::Entry(entry) = discover_entry(&mut gateway).unwrap() else {
@@ -1356,7 +1361,7 @@ mod tests {
             response("portal", ""),
             response(r#"{"result":"fail","message":"bad credentials"}"#, ""),
         ]);
-        let mut gateway = Gateway::new(&Config::default()).unwrap();
+        let mut gateway = Gateway::new(&test_config()).unwrap();
         gateway.login_proxy = proxy_client(address);
         let portal = "http://10.245.2.20/eportal/index.jsp?wlanuserip=SESSION";
         gateway.get_login(portal).unwrap();

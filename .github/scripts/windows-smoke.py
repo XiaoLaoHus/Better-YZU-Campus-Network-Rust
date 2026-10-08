@@ -128,8 +128,14 @@ def click(window, name):
 
 def type_into(window, name, value):
     edit = wait_until(lambda: control_for(window, name, "Edit"), f"input {name}")
-    edit.click_input()
+    # AccessKit exposes logical focus directly. A coordinate click can miss
+    # when a popup has just closed or the runner is still updating geometry.
+    edit.set_focus()
+    time.sleep(0.2)
     keyboard.send_keys("^a{BACKSPACE}" + value, pause=0.03, with_spaces=True)
+    if name == AUTH_LABEL:
+        wait_until(lambda: control_for(window, name, "Edit").get_value() == value,
+                   "authentication URL input committed")
 
 
 def post(hwnd, message, w=0, l=0):
